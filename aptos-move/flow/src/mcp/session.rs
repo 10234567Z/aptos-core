@@ -35,12 +35,17 @@ impl FlowSession {
         let router = Self::package_manifest_router()
             + Self::package_status_router()
             + Self::package_verify_router()
-            + Self::package_spec_infer_router();
+            + Self::package_spec_infer_router()
+            + Self::package_test_router();
         router
             .list_all()
             .into_iter()
             .map(|t| t.name.to_string())
             .collect()
+    }
+
+    pub(crate) fn args(&self) -> &McpArgs {
+        &self.args
     }
 
     pub(crate) fn new(args: McpArgs, global: GlobalOpts) -> Self {
@@ -65,7 +70,8 @@ impl FlowSession {
             tool_router: Self::package_manifest_router()
                 + Self::package_status_router()
                 + Self::package_verify_router()
-                + Self::package_spec_infer_router(),
+                + Self::package_spec_infer_router()
+                + Self::package_test_router(),
         }
     }
 

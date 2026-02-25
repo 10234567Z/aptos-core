@@ -4,7 +4,7 @@
 pub(crate) mod file_watcher;
 mod package_data;
 pub(crate) mod session;
-mod tools;
+pub(crate) mod tools;
 
 use crate::GlobalOpts;
 use anyhow::Result;
@@ -18,7 +18,7 @@ use session::FlowSession;
 #[derive(Parser, Debug, Clone)]
 pub struct McpArgs {
     /// Build in dev mode (enables dev-only dependencies and addresses).
-    #[arg(long)]
+    #[arg(long, default_value_t = true)]
     pub dev_mode: bool,
 
     /// Additional named addresses in the form `name=0xADDR`.

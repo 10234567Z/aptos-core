@@ -10,9 +10,11 @@ mod common;
 
 mod edit_hook;
 mod list_tools;
+mod move_package_coverage;
 mod move_package_manifest;
 mod move_package_spec_infer;
 mod move_package_status;
+mod move_package_test;
 mod move_package_verify;
 
 use super::*;

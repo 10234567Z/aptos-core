@@ -1,5 +1,28 @@
 [
   {
+    "name": "move_package_coverage",
+    "description": "Get uncovered source lines for a package (per module and function). Uses existing coverage map if available, otherwise runs tests first. Use this to identify which code paths need test coverage.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "MovePackageCoverageParams",
+      "type": "object",
+      "properties": {
+        "package_path": {
+          "description": "Path to the Move package directory.",
+          "type": "string"
+        },
+        "filter": {
+          "description": "Optional module name filter (substring match).",
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "required": [
+        "package_path"
+      ]
+    }
+  },
+  {
     "name": "move_package_manifest",
     "description": "Get information about the current Move package",
     "inputSchema": {
@@ -51,6 +74,29 @@
         "package_path": {
           "description": "Path to the Move package directory.",
           "type": "string"
+        }
+      },
+      "required": [
+        "package_path"
+      ]
+    }
+  },
+  {
+    "name": "move_package_test",
+    "description": "Run Move unit tests for a package. Set establish_baseline=true to save current coverage as baseline (use before generating new tests). Without establish_baseline, returns lines newly covered since baseline. If no baseline exists, all covered lines are reported as newly_covered.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "MovePackageTestParams",
+      "type": "object",
+      "properties": {
+        "package_path": {
+          "description": "Path to the Move package directory.",
+          "type": "string"
+        },
+        "establish_baseline": {
+          "description": "If true, save current coverage as baseline for future comparisons.\nUse this in the first test run before generating new tests.",
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [
