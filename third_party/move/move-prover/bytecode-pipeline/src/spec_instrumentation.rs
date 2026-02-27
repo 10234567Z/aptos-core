@@ -8,11 +8,16 @@ use crate::{options::ProverOptions, verification_analysis};
 use itertools::Itertools;
 use move_model::{
     ast,
-    ast::{Exp, ExpData, QuantKind, TempIndex, Value},
+    ast::{ConditionKind, Exp, ExpData, LemmaDecl, Pattern, Proof, QuantKind, TempIndex, Value},
     exp_generator::ExpGenerator,
-    model::{FunId, FunctionEnv, GlobalEnv, Loc, ModuleId, QualifiedId, QualifiedInstId, StructId},
+    exp_rewriter::{ExpRewriter, ExpRewriterFunctions, RewriteTarget},
+    model::{
+        FunId, FunctionEnv, GlobalEnv, Loc, ModuleId, NodeId, Parameter, QualifiedId,
+        QualifiedInstId, StructId,
+    },
     pragmas::{ABORTS_IF_IS_PARTIAL_PRAGMA, EMITS_IS_PARTIAL_PRAGMA, EMITS_IS_STRICT_PRAGMA},
     spec_translator::{SpecTranslator, TranslatedSpec},
+    symbol::Symbol,
     ty::{ReferenceKind, Type, TypeDisplayContext, BOOL_TYPE, NUM_TYPE},
 };
 use move_stackless_bytecode::{
@@ -44,103 +49,17 @@ const EMITS_FAILS_MESSAGE: &str = "function does not emit the expected event";
 const EMITS_NOT_COVERED: &str = "emitted event not covered by any of the `emits` clauses";
 const CHOICE_WITNESS_FAILS_MESSAGE: &str = "choice expression requires a witness to exist";
 
-fn modify_check_fails_message(
-    env: &GlobalEnv,
-    mem: QualifiedId<StructId>,
-    targs: &[Type],
-) -> String {
-    let targs_str = if targs.is_empty() {
-        "".to_string()
-    } else {
-        let tctx = TypeDisplayContext::new(env);
-        format!(
-            "<{}>",
-            targs
-                .iter()
-                .map(|ty| ty.display(&tctx).to_string())
-                .join(", ")
-        )
-    };
-    let module_env = env.get_module(mem.module_id);
-    format!(
-        "caller does not have permission to modify `{}::{}{}` at given address",
-        module_env.get_name().display(env),
-        module_env
-            .get_struct(mem.id)
-            .get_name()
-            .display(env.symbol_pool()),
-        targs_str
-    )
+/// Controls which proof statements are emitted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProofEmitMode {
+    /// Emit non-`post` statements (entry point of the function).
+    EntryPoint,
+    /// Emit only statements wrapped in `post` (return point).
+    ReturnPoint,
 }
 
-/// Checks if an expression uses memory operations or behavioral predicates.
-/// This is used to determine if a choice expression needs a well-formedness assertion.
-fn uses_memory_or_behavior(exp: &Exp) -> bool {
-    use ast::Operation;
-    let mut uses_memory = false;
-    exp.visit_pre_order(&mut |e| {
-        if let ExpData::Call(_, op, _) = e {
-            match op {
-                Operation::Global(_)
-                | Operation::Exists(_)
-                | Operation::CanModify
-                | Operation::ResourceDomain
-                | Operation::Behavior(..) => {
-                    uses_memory = true;
-                    return false; // stop traversal
-                },
-                _ => {},
-            }
-        }
-        !uses_memory // continue only if we haven't found memory ops
-    });
-    uses_memory
-}
-
-/// For choice expressions that involve memory or behavioral predicates,
-/// return the existential well-formedness check.
-/// Converts `choose y: T where pred(y)` to `exists y: T :: pred(y)`.
-///
-/// We only emit this for choices involving state/memory because:
-/// 1. The SMT solver may not be able to prove simple mathematical existentials
-///    like `exists i: u64 :: i > 0` due to quantifier handling
-/// 2. The fix is specifically needed for behavioral predicates and stateful choices
-///    where Z3 ignores the conditional choice axiom
-fn extract_choice_exists_check(env: &GlobalEnv, exp: &Exp) -> Option<Exp> {
-    if let ExpData::Quant(node_id, kind, ranges, triggers, condition, body) = exp.as_ref() {
-        if kind.is_choice() {
-            // Only emit well-formedness assertion for choices involving memory/state
-            // Pure mathematical choices don't need this and may cause false positives
-            if !uses_memory_or_behavior(body)
-                && condition
-                    .as_ref()
-                    .is_none_or(|c| !uses_memory_or_behavior(c))
-            {
-                return None;
-            }
-            // Create exists with same structure but QuantKind::Exists
-            let exists_id = env.new_node(env.get_node_loc(*node_id), BOOL_TYPE.clone());
-            if let Some(inst) = env.get_node_instantiation_opt(*node_id) {
-                env.set_node_instantiation(exists_id, inst);
-            }
-            return Some(
-                ExpData::Quant(
-                    exists_id,
-                    QuantKind::Exists,
-                    ranges.clone(),
-                    triggers.clone(),
-                    condition.clone(),
-                    body.clone(),
-                )
-                .into_exp(),
-            );
-        }
-    }
-    None
-}
-
-//  ================================================================================================
-/// # Spec Instrumenter
+// ================================================================================================
+// # Spec Instrumenter
 
 pub struct SpecInstrumentationProcessor {}
 
@@ -179,18 +98,33 @@ impl FunctionTargetProcessor for SpecInstrumentationProcessor {
             // out of this data and into the clone.
             let mut verification_data =
                 data.fork(FunctionVariant::Verification(VerificationFlavor::Regular));
-            verification_data =
+            let (instrumented, split_points) =
                 Instrumenter::run(&options, targets, fun_env, verification_data, scc_opt);
-            targets.insert_target_data(
-                &fun_env.get_qualified_id(),
-                verification_data.variant.clone(),
-                verification_data,
-            );
+            verification_data = instrumented;
+
+            if split_points.is_empty() {
+                // No splits — insert the single verification variant.
+                targets.insert_target_data(
+                    &fun_env.get_qualified_id(),
+                    verification_data.variant.clone(),
+                    verification_data,
+                );
+            } else {
+                // Expand splits into multiple verification variants.
+                Self::expand_splits(
+                    fun_env.module_env.env,
+                    targets,
+                    fun_env,
+                    verification_data,
+                    &split_points,
+                );
+            }
         }
 
         // Instrument baseline variant only if it is inlined.
         if is_inlined {
-            Instrumenter::run(&options, targets, fun_env, data, scc_opt)
+            let (data, _) = Instrumenter::run(&options, targets, fun_env, data, scc_opt);
+            data
         } else {
             // Clear code but keep function data stub.
             // TODO(refactoring): the stub is currently still needed because boogie_wrapper
@@ -221,7 +155,7 @@ impl FunctionTargetProcessor for SpecInstrumentationProcessor {
                 continue;
             }
             for ref fun in module.get_functions() {
-                if fun.is_inline() {
+                if !fun.is_compiled() {
                     continue;
                 }
                 for (variant, target) in targets.get_targets(fun) {
@@ -243,6 +177,142 @@ impl FunctionTargetProcessor for SpecInstrumentationProcessor {
     }
 }
 
+/// Maximum number of split combinations before we emit an error.
+const MAX_SPLIT_COMBINATIONS: usize = 1024;
+
+impl SpecInstrumentationProcessor {
+    /// Expand split points into multiple verification variants.
+    /// Each split point on a bool expression creates 2 cases; on an enum, N cases
+    /// (one per variant). The total combinations is the product of all case counts.
+    fn expand_splits(
+        env: &GlobalEnv,
+        targets: &mut FunctionTargetsHolder,
+        fun_env: &FunctionEnv,
+        verification_data: FunctionData,
+        split_points: &[(usize, Exp)],
+    ) {
+        // Determine the number of cases for each split point, validating types.
+        let mut has_error = false;
+        let case_counts: Vec<usize> = split_points
+            .iter()
+            .map(|(_, exp)| {
+                let ty = env.get_node_type(exp.node_id());
+                if ty == BOOL_TYPE {
+                    2
+                } else if let Some((struct_env, _)) = ty.get_struct(env) {
+                    if struct_env.has_variants() {
+                        struct_env.get_variants().count()
+                    } else {
+                        env.error(
+                            &env.get_node_loc(exp.node_id()),
+                            "`split` expression must be of type `bool` or an enum type",
+                        );
+                        has_error = true;
+                        2
+                    }
+                } else {
+                    env.error(
+                        &env.get_node_loc(exp.node_id()),
+                        "`split` expression must be of type `bool` or an enum type",
+                    );
+                    has_error = true;
+                    2
+                }
+            })
+            .collect();
+
+        if has_error {
+            // Insert the original variant to avoid cascading errors.
+            targets.insert_target_data(
+                &fun_env.get_qualified_id(),
+                verification_data.variant.clone(),
+                verification_data,
+            );
+            return;
+        }
+
+        let total: usize = case_counts.iter().product();
+        if total > MAX_SPLIT_COMBINATIONS {
+            env.error(
+                &fun_env.get_loc(),
+                &format!(
+                    "split produces {} verification variants, exceeding the limit of {}",
+                    total, MAX_SPLIT_COMBINATIONS
+                ),
+            );
+            // Fall back: insert the original (with Nop placeholders) as single variant.
+            targets.insert_target_data(
+                &fun_env.get_qualified_id(),
+                verification_data.variant.clone(),
+                verification_data,
+            );
+            return;
+        }
+
+        let original_flavor = match &verification_data.variant {
+            FunctionVariant::Verification(f) => f.clone(),
+            _ => VerificationFlavor::Regular,
+        };
+
+        for combo in 0..total {
+            let new_flavor = VerificationFlavor::Split(Box::new(original_flavor.clone()), combo);
+            let new_variant = FunctionVariant::Verification(new_flavor);
+            let mut forked = verification_data.fork(new_variant.clone());
+
+            // For each split point, replace the Nop at that offset with the
+            // appropriate Assume.
+            let mut remainder = combo;
+            for (i, (offset, exp)) in split_points.iter().enumerate() {
+                let case_idx = remainder % case_counts[i];
+                remainder /= case_counts[i];
+
+                let ty = env.get_node_type(exp.node_id());
+                let assume_exp = if ty == BOOL_TYPE {
+                    if case_idx == 0 {
+                        // true case: assume the expression
+                        exp.clone()
+                    } else {
+                        // false case: assume !expression
+                        let not_node =
+                            env.new_node(env.get_node_loc(exp.node_id()), BOOL_TYPE.clone());
+                        ExpData::Call(not_node, ast::Operation::Not, vec![exp.clone()]).into_exp()
+                    }
+                } else if let Some((struct_env, inst)) = ty.get_struct(env) {
+                    // Enum case: assume TestVariants for variant at case_idx
+                    let variant_sym: Symbol = struct_env
+                        .get_variants()
+                        .nth(case_idx)
+                        .expect("variant exists");
+                    let test_node =
+                        env.new_node(env.get_node_loc(exp.node_id()), BOOL_TYPE.clone());
+                    env.set_node_instantiation(test_node, inst.to_vec());
+                    ExpData::Call(
+                        test_node,
+                        ast::Operation::TestVariants(
+                            struct_env.module_env.get_id(),
+                            struct_env.get_id(),
+                            vec![variant_sym],
+                        ),
+                        vec![exp.clone()],
+                    )
+                    .into_exp()
+                } else {
+                    // Fallback (shouldn't happen): just assume the expression
+                    exp.clone()
+                };
+
+                // Replace the Nop at offset with Prop(Assume, assume_exp)
+                if let Some(Bytecode::Nop(attr_id)) = forked.code.get(*offset) {
+                    let attr_id = *attr_id;
+                    forked.code[*offset] = Bytecode::Prop(attr_id, PropKind::Assume, assume_exp);
+                }
+            }
+
+            targets.insert_target_data(&fun_env.get_qualified_id(), new_variant, forked);
+        }
+    }
+}
+
 struct Instrumenter<'a> {
     options: &'a ProverOptions,
     builder: FunctionDataBuilder<'a>,
@@ -253,17 +323,21 @@ struct Instrumenter<'a> {
     abort_label: Label,
     can_abort: bool,
     mem_info: &'a BTreeSet<QualifiedInstId<StructId>>,
+    /// Map from bytecode offset to split expression (for `split` proof items).
+    split_points: Vec<(usize, Exp)>,
 }
 
+// =================================================================================================
+// # Core Instrumentation
+
 impl<'a> Instrumenter<'a> {
-    #[allow(clippy::needless_collect)]
     fn run(
         options: &'a ProverOptions,
         targets: &mut FunctionTargetsHolder,
         fun_env: &FunctionEnv<'a>,
         data: FunctionData,
         scc_opt: Option<&[FunctionEnv]>,
-    ) -> FunctionData {
+    ) -> (FunctionData, Vec<(usize, Exp)>) {
         // Pre-collect properties in the original function data
         let props: Vec<_> = data
             .code
@@ -350,8 +424,12 @@ impl<'a> Instrumenter<'a> {
             abort_label,
             can_abort: false,
             mem_info: &mem_info,
+            split_points: vec![],
         };
         instrumenter.instrument(&spec, &inlined_props);
+
+        // Extract split points before consuming the instrumenter.
+        let split_points = std::mem::take(&mut instrumenter.split_points);
 
         // Run copy propagation (reaching definitions) and then assignment
         // elimination (live vars). This cleans up some redundancy created by
@@ -360,7 +438,10 @@ impl<'a> Instrumenter<'a> {
         let reach_def = ReachingDefProcessor::new();
         let live_vars = LiveVarAnalysisProcessor::new_no_annotate();
         data = reach_def.process(targets, fun_env, data, scc_opt);
-        live_vars.process(targets, fun_env, data, scc_opt)
+        (
+            live_vars.process(targets, fun_env, data, scc_opt),
+            split_points,
+        )
     }
 
     fn is_verified(&self) -> bool {
@@ -407,6 +488,11 @@ impl<'a> Instrumenter<'a> {
                     exp,
                     exp.call_args()[0].to_owned(),
                 );
+            }
+
+            // Emit entry-point proof statements (non-`post` statements from proof blocks).
+            if let Some(proof) = self.builder.fun_env.get_spec().proof.clone() {
+                self.emit_proof(&proof, None, &mut vec![], ProofEmitMode::EntryPoint);
             }
 
             // For the verification variant, we generate post-conditions. Inject any state
@@ -787,7 +873,12 @@ impl<'a> Instrumenter<'a> {
             self.generate_opaque_call(dests, mid, fid, targs, srcs, aa, false);
         }
     }
+}
 
+// =================================================================================================
+// # Spec Condition Emission
+
+impl<'a> Instrumenter<'a> {
     fn emit_save_for_old(&mut self, vars: &BTreeMap<TempIndex, TempIndex>) {
         use Bytecode::*;
         for (idx, saved_idx) in vars {
@@ -916,8 +1007,7 @@ impl<'a> Instrumenter<'a> {
             .iter()
             .filter(|(_, is_post, ..)| *is_post == post_state);
         for (loc, _, _, exp) in lets {
-            let env = self.builder.global_env();
-            if let Some(exists_check) = extract_choice_exists_check(env, exp) {
+            if let Some(exists_check) = self.extract_choice_exists_check(exp) {
                 self.builder
                     .set_loc_and_vc_info(loc.clone(), CHOICE_WITNESS_FAILS_MESSAGE);
                 self.builder
@@ -973,6 +1063,95 @@ impl<'a> Instrumenter<'a> {
         }
     }
 
+    /// Checks if an expression uses memory operations or behavioral predicates.
+    fn uses_memory_or_behavior(exp: &Exp) -> bool {
+        use ast::Operation;
+        let mut uses_memory = false;
+        exp.visit_pre_order(&mut |e| {
+            if let ExpData::Call(
+                _,
+                Operation::Global(_)
+                | Operation::Exists(_)
+                | Operation::CanModify
+                | Operation::ResourceDomain
+                | Operation::Behavior(..),
+                _,
+            ) = e
+            {
+                uses_memory = true;
+                return false; // stop traversal
+            }
+            !uses_memory // continue only if we haven't found memory ops
+        });
+        uses_memory
+    }
+
+    /// Extract an exists-check from a choice expression for well-formedness assertions.
+    fn extract_choice_exists_check(&self, exp: &Exp) -> Option<Exp> {
+        let env = self.builder.global_env();
+        if let ExpData::Quant(node_id, kind, ranges, triggers, condition, body) = exp.as_ref()
+            && kind.is_choice()
+        {
+            if !Self::uses_memory_or_behavior(body)
+                && condition
+                    .as_ref()
+                    .is_none_or(|c| !Self::uses_memory_or_behavior(c))
+            {
+                return None;
+            }
+            let exists_id = env.new_node(env.get_node_loc(*node_id), BOOL_TYPE.clone());
+            if let Some(inst) = env.get_node_instantiation_opt(*node_id) {
+                env.set_node_instantiation(exists_id, inst);
+            }
+            return Some(
+                ExpData::Quant(
+                    exists_id,
+                    QuantKind::Exists,
+                    ranges.clone(),
+                    triggers.clone(),
+                    condition.clone(),
+                    body.clone(),
+                )
+                .into_exp(),
+            );
+        }
+        None
+    }
+
+    fn modify_check_fails_message(
+        env: &GlobalEnv,
+        mem: QualifiedId<StructId>,
+        targs: &[Type],
+    ) -> String {
+        let targs_str = if targs.is_empty() {
+            "".to_string()
+        } else {
+            let tctx = TypeDisplayContext::new(env);
+            format!(
+                "<{}>",
+                targs
+                    .iter()
+                    .map(|ty| ty.display(&tctx).to_string())
+                    .join(", ")
+            )
+        };
+        let module_env = env.get_module(mem.module_id);
+        format!(
+            "caller does not have permission to modify `{}::{}{}` at given address",
+            module_env.get_name().display(env),
+            module_env
+                .get_struct(mem.id)
+                .get_name()
+                .display(env.symbol_pool()),
+            targs_str
+        )
+    }
+}
+
+// =================================================================================================
+// # Block Generation
+
+impl<'a> Instrumenter<'a> {
     fn generate_abort_block(&mut self, spec: &TranslatedSpec) {
         use Bytecode::*;
         // Set the location to the function and emit label.
@@ -1096,6 +1275,14 @@ impl<'a> Instrumenter<'a> {
                 self.builder.emit_with(|id| Prop(id, Assert, exp))
             }
 
+            // Emit return-point proof statements (`post`-prefixed statements from proof blocks).
+            if let Some(proof) = self.builder.fun_env.get_spec().proof.clone() {
+                let env = self.builder.global_env();
+                let ret_locals = self.ret_locals.clone();
+                let proof = Self::rewrite_result_refs(env, &proof, &ret_locals);
+                self.emit_proof(&proof, None, &mut vec![], ProofEmitMode::ReturnPoint);
+            }
+
             // Emit all post-conditions which must hold as we do not abort.
             for (loc, cond) in &spec.post {
                 self.emit_traces(spec, cond);
@@ -1165,7 +1352,7 @@ impl<'a> Instrumenter<'a> {
                 let (mid, sid, inst) = resource_type.require_struct();
                 self.builder.set_loc_and_vc_info(
                     loc.clone(),
-                    &modify_check_fails_message(env, mid.qualified(sid), inst),
+                    &Self::modify_check_fails_message(env, mid.qualified(sid), inst),
                 );
             } else {
                 self.builder.set_loc(loc.clone());
@@ -1195,16 +1382,417 @@ impl<'a> Instrumenter<'a> {
     }
 }
 
+// =================================================================================================
+// # Proof Emission
+
+impl<'a> Instrumenter<'a> {
+    /// Emits bytecode for a proof construct, with an optional path condition for
+    /// guarding assertions/assumptions under `if/else`.
+    /// `let_substs` tracks let-bound variables for inline substitution.
+    /// `mode` controls whether we emit entry-point or return-point statements.
+    fn emit_proof(
+        &mut self,
+        proof: &Proof,
+        path_condition: Option<&Exp>,
+        let_substs: &mut Vec<(Symbol, Exp)>,
+        mode: ProofEmitMode,
+    ) {
+        match proof {
+            Proof::Post(_, inner) => {
+                match mode {
+                    ProofEmitMode::EntryPoint => {
+                        // At entry point, skip Post entirely.
+                    },
+                    ProofEmitMode::ReturnPoint => {
+                        // At return point, unwrap Post and emit inner in EntryPoint mode
+                        // (the inner statements should emit normally).
+                        self.emit_proof(
+                            inner,
+                            path_condition,
+                            let_substs,
+                            ProofEmitMode::EntryPoint,
+                        );
+                    },
+                }
+            },
+            Proof::Assert(loc, exp) => {
+                if mode == ProofEmitMode::ReturnPoint {
+                    return;
+                }
+                let exp = self.apply_let_substs(exp, let_substs);
+                let guarded = self.guard_exp(&exp, path_condition);
+                self.builder
+                    .set_loc_and_vc_info(loc.clone(), "proof assertion");
+                self.builder
+                    .emit_with(|id| Bytecode::Prop(id, PropKind::Assert, guarded));
+            },
+            Proof::Assume(loc, exp) => {
+                if mode == ProofEmitMode::ReturnPoint {
+                    return;
+                }
+                let exp = self.apply_let_substs(exp, let_substs);
+                let guarded = self.guard_exp(&exp, path_condition);
+                self.builder.set_loc(loc.clone());
+                self.builder
+                    .emit_with(|id| Bytecode::Prop(id, PropKind::Assume, guarded));
+            },
+            Proof::Let(_loc, sym, exp) => {
+                // Always record let substitutions — they may be needed by subsequent
+                // `post` statements even during the ReturnPoint pass.
+                let exp = self.apply_let_substs(exp, let_substs);
+                let_substs.push((*sym, exp));
+            },
+            Proof::IfElse(_, cond, then_proof, else_proof) => {
+                let cond = self.apply_let_substs(cond, let_substs);
+                let then_cond = match path_condition {
+                    Some(pc) => self
+                        .builder
+                        .mk_bool_call(ast::Operation::And, vec![pc.clone(), cond.clone()]),
+                    None => cond.clone(),
+                };
+                self.emit_proof(then_proof, Some(&then_cond), let_substs, mode);
+                if let Some(eb) = else_proof {
+                    let not_cond = self.builder.mk_not(cond);
+                    let else_cond = match path_condition {
+                        Some(pc) => self
+                            .builder
+                            .mk_bool_call(ast::Operation::And, vec![pc.clone(), not_cond]),
+                        None => not_cond,
+                    };
+                    self.emit_proof(eb, Some(&else_cond), let_substs, mode);
+                }
+            },
+            Proof::Block(_, stmts) => {
+                let saved_len = let_substs.len();
+                for stmt in stmts {
+                    self.emit_proof(stmt, path_condition, let_substs, mode);
+                }
+                let_substs.truncate(saved_len);
+            },
+            Proof::Apply(loc, lemma_qid, args) => {
+                if mode == ProofEmitMode::ReturnPoint {
+                    return;
+                }
+                let env = self.builder.global_env();
+                let args: Vec<Exp> = args
+                    .iter()
+                    .map(|a| Self::apply_let_substs_impl(env, a, let_substs))
+                    .collect();
+                let module_env = env.get_module(lemma_qid.module_id);
+                let lemma = module_env.get_lemma(lemma_qid.id);
+                self.emit_lemma_apply(loc, lemma, &args, path_condition);
+            },
+            Proof::ForallApply(loc, binds, patterns, lemma_qid, args) => {
+                if mode == ProofEmitMode::ReturnPoint {
+                    return;
+                }
+                let env = self.builder.global_env();
+                let args: Vec<Exp> = args
+                    .iter()
+                    .map(|a| Self::apply_let_substs_impl(env, a, let_substs))
+                    .collect();
+                let module_env = env.get_module(lemma_qid.module_id);
+                let lemma = module_env.get_lemma(lemma_qid.id);
+                self.emit_forall_lemma_apply(loc, lemma, binds, patterns, &args, path_condition);
+            },
+            Proof::Calc(loc, steps) => {
+                if mode == ProofEmitMode::ReturnPoint {
+                    return;
+                }
+                for (lhs, op, rhs) in steps {
+                    let env = self.builder.global_env();
+                    let lhs = Self::apply_let_substs_impl(env, lhs, let_substs);
+                    let rhs = Self::apply_let_substs_impl(env, rhs, let_substs);
+                    let cmp_node_id = env.new_node(loc.clone(), BOOL_TYPE.clone());
+                    let cmp_exp = ExpData::Call(cmp_node_id, op.clone(), vec![lhs, rhs]).into_exp();
+                    let guarded = self.guard_exp(&cmp_exp, path_condition);
+                    self.builder.set_loc_and_vc_info(loc.clone(), "calc step");
+                    self.builder
+                        .emit_with(|id| Bytecode::Prop(id, PropKind::Assert, guarded));
+                }
+            },
+            Proof::Split(loc, exp) => {
+                if mode == ProofEmitMode::ReturnPoint {
+                    return;
+                }
+                let exp = self.apply_let_substs(exp, let_substs);
+                let guarded = self.guard_exp(&exp, path_condition);
+                self.builder.set_loc(loc.clone());
+                // Emit a Nop placeholder; record offset → expr for later expansion.
+                let offset = self.builder.data.code.len();
+                self.builder.emit_with(Bytecode::Nop);
+                self.split_points.push((offset, guarded));
+            },
+        }
+    }
+
+    /// Emit bytecode for `apply lemma(args)`: assert each requires, assume each ensures,
+    /// with parameters substituted by the provided arguments.
+    fn emit_lemma_apply(
+        &mut self,
+        loc: &Loc,
+        lemma: &LemmaDecl,
+        args: &[Exp],
+        path_condition: Option<&Exp>,
+    ) {
+        for cond in &lemma.conditions {
+            let env = self.builder.global_env();
+            let subst_exp = Self::substitute_params(env, &lemma.params, args, &cond.exp);
+            match &cond.kind {
+                ConditionKind::Requires => {
+                    let guarded = self.guard_exp(&subst_exp, path_condition);
+                    self.builder
+                        .set_loc_and_vc_info(loc.clone(), "lemma requires");
+                    self.builder
+                        .emit_with(|id| Bytecode::Prop(id, PropKind::Assert, guarded));
+                },
+                ConditionKind::Ensures => {
+                    let guarded = self.guard_exp(&subst_exp, path_condition);
+                    self.builder.set_loc(loc.clone());
+                    self.builder
+                        .emit_with(|id| Bytecode::Prop(id, PropKind::Assume, guarded));
+                },
+                _ => {},
+            }
+        }
+    }
+
+    /// Emit bytecode for `forall binds [triggers] apply lemma(args)`:
+    /// Builds `assume forall binds :: {triggers} (conj(requires) ==> conj(ensures))`
+    /// where requires and ensures have parameters substituted with args.
+    fn emit_forall_lemma_apply(
+        &mut self,
+        loc: &Loc,
+        lemma: &LemmaDecl,
+        binds: &[(Symbol, Type)],
+        patterns: &[Vec<Exp>],
+        args: &[Exp],
+        path_condition: Option<&Exp>,
+    ) {
+        let env = self.builder.global_env();
+        // Build substituted requires conjunction.
+        let requires: Vec<Exp> = lemma
+            .conditions
+            .iter()
+            .filter(|c| matches!(c.kind, ConditionKind::Requires))
+            .map(|c| Self::substitute_params(env, &lemma.params, args, &c.exp))
+            .collect();
+
+        // Build substituted ensures conjunction.
+        let ensures: Vec<Exp> = lemma
+            .conditions
+            .iter()
+            .filter(|c| matches!(c.kind, ConditionKind::Ensures))
+            .map(|c| Self::substitute_params(env, &lemma.params, args, &c.exp))
+            .collect();
+
+        // Build: conj(requires) ==> conj(ensures)
+        let req_conj = self
+            .builder
+            .mk_join_bool(ast::Operation::And, requires.into_iter());
+        let ens_conj = self
+            .builder
+            .mk_join_bool(ast::Operation::And, ensures.into_iter());
+        let body = if let Some(req) = req_conj {
+            if let Some(ens) = ens_conj {
+                self.builder
+                    .mk_bool_call(ast::Operation::Implies, vec![req, ens])
+            } else {
+                return; // no ensures, nothing to assume
+            }
+        } else if let Some(ens) = ens_conj {
+            ens // no requires, body is just the ensures
+        } else {
+            return;
+        };
+
+        // Build quantifier ranges.
+        let ranges: Vec<(Pattern, Exp)> = binds
+            .iter()
+            .map(|(sym, ty)| {
+                let var_node_id = env.new_node(loc.clone(), Type::TypeDomain(Box::new(ty.clone())));
+                let range_exp =
+                    ExpData::Call(var_node_id, ast::Operation::TypeDomain, vec![]).into_exp();
+                let pat_node_id = env.new_node(loc.clone(), ty.clone());
+                let pat = Pattern::Var(pat_node_id, *sym);
+                (pat, range_exp)
+            })
+            .collect();
+
+        // Build forall expression.
+        let quant_node_id = env.new_node(loc.clone(), BOOL_TYPE.clone());
+        let quant_exp = ExpData::Quant(
+            quant_node_id,
+            QuantKind::Forall,
+            ranges,
+            patterns.to_vec(),
+            None,
+            body,
+        )
+        .into_exp();
+
+        let guarded = self.guard_exp(&quant_exp, path_condition);
+        self.builder.set_loc(loc.clone());
+        self.builder
+            .emit_with(|id| Bytecode::Prop(id, PropKind::Assume, guarded));
+    }
+
+    /// Rewrite `Operation::Result(i)` in proof expressions to `Temporary(ret_temps[i])`
+    /// so that `result` references in proof blocks resolve to the actual return value.
+    fn rewrite_result_refs(env: &GlobalEnv, proof: &Proof, ret_temps: &[TempIndex]) -> Proof {
+        fn rewrite_exp_results(_env: &GlobalEnv, exp: &Exp, ret_temps: &[TempIndex]) -> Exp {
+            struct ResultRewriter<'a> {
+                ret_temps: &'a [TempIndex],
+            }
+            impl ExpRewriterFunctions for ResultRewriter<'_> {
+                fn rewrite_call(
+                    &mut self,
+                    id: NodeId,
+                    oper: &ast::Operation,
+                    _args: &[Exp],
+                ) -> Option<Exp> {
+                    if let ast::Operation::Result(i) = oper
+                        && let Some(&temp_idx) = self.ret_temps.get(*i)
+                    {
+                        return Some(ExpData::Temporary(id, temp_idx).into_exp());
+                    }
+                    None
+                }
+            }
+            let mut rewriter = ResultRewriter { ret_temps };
+            rewriter.rewrite_exp(exp.clone())
+        }
+
+        fn rewrite_proof(env: &GlobalEnv, proof: &Proof, ret_temps: &[TempIndex]) -> Proof {
+            match proof {
+                Proof::Assert(loc, exp) => {
+                    Proof::Assert(loc.clone(), rewrite_exp_results(env, exp, ret_temps))
+                },
+                Proof::Assume(loc, exp) => {
+                    Proof::Assume(loc.clone(), rewrite_exp_results(env, exp, ret_temps))
+                },
+                Proof::Let(loc, sym, exp) => {
+                    Proof::Let(loc.clone(), *sym, rewrite_exp_results(env, exp, ret_temps))
+                },
+                Proof::IfElse(loc, cond, then_p, else_p) => Proof::IfElse(
+                    loc.clone(),
+                    rewrite_exp_results(env, cond, ret_temps),
+                    Box::new(rewrite_proof(env, then_p, ret_temps)),
+                    else_p
+                        .as_ref()
+                        .map(|p| Box::new(rewrite_proof(env, p, ret_temps))),
+                ),
+                Proof::Block(loc, stmts) => Proof::Block(
+                    loc.clone(),
+                    stmts
+                        .iter()
+                        .map(|s| rewrite_proof(env, s, ret_temps))
+                        .collect(),
+                ),
+                Proof::Apply(loc, qid, args) => Proof::Apply(
+                    loc.clone(),
+                    *qid,
+                    args.iter()
+                        .map(|a| rewrite_exp_results(env, a, ret_temps))
+                        .collect(),
+                ),
+                Proof::ForallApply(loc, binds, pats, qid, args) => Proof::ForallApply(
+                    loc.clone(),
+                    binds.clone(),
+                    pats.clone(),
+                    *qid,
+                    args.iter()
+                        .map(|a| rewrite_exp_results(env, a, ret_temps))
+                        .collect(),
+                ),
+                Proof::Calc(loc, steps) => Proof::Calc(
+                    loc.clone(),
+                    steps
+                        .iter()
+                        .map(|(l, op, r)| {
+                            (
+                                rewrite_exp_results(env, l, ret_temps),
+                                op.clone(),
+                                rewrite_exp_results(env, r, ret_temps),
+                            )
+                        })
+                        .collect(),
+                ),
+                Proof::Post(loc, inner) => {
+                    Proof::Post(loc.clone(), Box::new(rewrite_proof(env, inner, ret_temps)))
+                },
+                Proof::Split(loc, exp) => {
+                    Proof::Split(loc.clone(), rewrite_exp_results(env, exp, ret_temps))
+                },
+            }
+        }
+        rewrite_proof(env, proof, ret_temps)
+    }
+
+    /// Apply accumulated let substitutions to an expression.
+    fn apply_let_substs(&self, exp: &Exp, substs: &[(Symbol, Exp)]) -> Exp {
+        Self::apply_let_substs_impl(self.builder.global_env(), exp, substs)
+    }
+
+    fn apply_let_substs_impl(env: &GlobalEnv, exp: &Exp, substs: &[(Symbol, Exp)]) -> Exp {
+        if substs.is_empty() {
+            return exp.clone();
+        }
+        let mut replacer = |_node_id: NodeId, target: RewriteTarget| -> Option<Exp> {
+            if let RewriteTarget::LocalVar(sym) = target {
+                // Search in reverse order so later bindings shadow earlier ones.
+                for (name, val) in substs.iter().rev() {
+                    if sym == *name {
+                        return Some(val.clone());
+                    }
+                }
+            }
+            None
+        };
+        ExpRewriter::new(env, &mut replacer).rewrite_exp(exp.clone())
+    }
+
+    /// If there's a path condition, wrap `exp` as `path_condition ==> exp`.
+    fn guard_exp(&mut self, exp: &Exp, path_condition: Option<&Exp>) -> Exp {
+        match path_condition {
+            Some(cond) => self
+                .builder
+                .mk_bool_call(ast::Operation::Implies, vec![cond.clone(), exp.clone()]),
+            None => exp.clone(),
+        }
+    }
+
+    /// Substitute lemma parameters with argument expressions in a condition expression.
+    fn substitute_params(env: &GlobalEnv, params: &[Parameter], args: &[Exp], exp: &Exp) -> Exp {
+        let mut replacer = |_node_id: NodeId, target: RewriteTarget| -> Option<Exp> {
+            match target {
+                RewriteTarget::LocalVar(sym) => {
+                    for (i, Parameter(param_name, _, _)) in params.iter().enumerate() {
+                        if sym == *param_name {
+                            return args.get(i).cloned();
+                        }
+                    }
+                    None
+                },
+                RewriteTarget::Temporary(idx) => {
+                    // Parameters are assigned sequential temporary indices starting at 0.
+                    args.get(idx).cloned()
+                },
+            }
+        };
+        ExpRewriter::new(env, &mut replacer).rewrite_exp(exp.clone())
+    }
+}
+
 //  ================================================================================================
 /// # Modifies Checker
-
 /// Check modifies annotations. This is depending on usage analysis and is therefore
 /// invoked here from the initialize trait function of this processor.
 fn check_modifies(env: &GlobalEnv, targets: &FunctionTargetsHolder) {
     for module_env in env.get_modules() {
         if module_env.is_target() {
             for fun_env in module_env.get_functions() {
-                if !fun_env.is_inline() {
+                if fun_env.is_compiled() {
                     check_caller_callee_modifies_relation(env, targets, &fun_env);
                     check_opaque_modifies_completeness(env, targets, &fun_env);
                 }
@@ -1227,7 +1815,8 @@ fn check_caller_callee_modifies_relation(
         .expect(COMPILED_MODULE_AVAILABLE)
     {
         let callee_fun_env = env.get_function(*callee);
-        if callee_fun_env.is_native() || callee_fun_env.is_intrinsic() {
+        if callee_fun_env.is_native() || callee_fun_env.is_intrinsic() || callee_fun_env.is_lemma()
+        {
             continue;
         }
         let callee_func_target = targets.get_target(&callee_fun_env, &FunctionVariant::Baseline);

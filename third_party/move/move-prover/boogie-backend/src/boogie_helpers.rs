@@ -830,10 +830,11 @@ fn boogie_debug_track(
     ty: &Type,
     bv_flag: bool,
 ) -> String {
-    let fun_def_idx = fun_target
-        .func_env
-        .get_def_idx()
-        .expect(COMPILED_MODULE_AVAILABLE);
+    // Lemma functions have no compiled bytecode definition, so skip debug tracking.
+    let fun_def_idx = match fun_target.func_env.get_def_idx() {
+        Some(idx) => idx,
+        None => return String::new(),
+    };
     let value = format!("$t{}", idx);
     if ty.is_reference() {
         let temp_name = boogie_temp(fun_target.global_env(), ty.skip_reference(), 0, bv_flag);

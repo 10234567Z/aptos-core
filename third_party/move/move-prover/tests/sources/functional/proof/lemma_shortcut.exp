@@ -1,0 +1,5 @@
+warning: proof uses trusted assumption
+   ┌─ tests/sources/functional/proof/lemma_shortcut.move:31:9
+   │
+31 │         assume [trusted] true;
+   │         ^^^^^^^^^^^^^^^^^^^^^^

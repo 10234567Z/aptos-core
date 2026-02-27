@@ -1,0 +1,5 @@
+warning: proof uses trusted assumption
+   ┌─ tests/sources/functional/proof/loop_with_lemma.move:16:13
+   │
+16 │             assume [trusted] true;
+   │             ^^^^^^^^^^^^^^^^^^^^^^

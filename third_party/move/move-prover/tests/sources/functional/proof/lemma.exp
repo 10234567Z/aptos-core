@@ -1,0 +1,11 @@
+warning: proof uses trusted assumption
+   ┌─ tests/sources/functional/proof/lemma.move:37:13
+   │
+37 │             assume [trusted] true;
+   │             ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: proof uses trusted assumption
+   ┌─ tests/sources/functional/proof/lemma.move:59:13
+   │
+59 │             assume [trusted] true;
+   │             ^^^^^^^^^^^^^^^^^^^^^^

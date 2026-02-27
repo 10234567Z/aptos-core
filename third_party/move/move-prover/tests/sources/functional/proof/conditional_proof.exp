@@ -1,0 +1,5 @@
+warning: proof uses trusted assumption
+   ┌─ tests/sources/functional/proof/conditional_proof.move:33:13
+   │
+33 │             assume [trusted] true;
+   │             ^^^^^^^^^^^^^^^^^^^^^^

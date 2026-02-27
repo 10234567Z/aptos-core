@@ -1,0 +1,11 @@
+warning: proof uses trusted assumption
+   ┌─ tests/sources/functional/proof/if_else.move:17:13
+   │
+17 │             assume [trusted] true;
+   │             ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: proof uses trusted assumption
+   ┌─ tests/sources/functional/proof/if_else.move:24:13
+   │
+24 │             assume [trusted] true;
+   │             ^^^^^^^^^^^^^^^^^^^^^^
