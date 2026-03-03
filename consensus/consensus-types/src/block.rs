@@ -452,7 +452,7 @@ impl Block {
     fn validate_signature_impl(
         &self,
         validator: &ValidatorVerifier,
-        primary_proof_verifier: &ValidatorVerifier,
+        _primary_proof_verifier: &ValidatorVerifier,
     ) -> anyhow::Result<()> {
         match self.block_data.block_type() {
             BlockType::Genesis => bail!("We should not accept genesis from others"),
@@ -479,11 +479,7 @@ impl Block {
                     || self.quorum_cert().verify(validator),
                 );
                 res1?;
-                res2?;
-                if let Some(primary_proof) = proposal_ext.primary_proof() {
-                    primary_proof.verify(primary_proof_verifier)?;
-                }
-                Ok(())
+                res2
             },
             BlockType::OptimisticProposal(p) => {
                 // Note: Optimistic proposal is not signed by proposer unlike normal proposal
@@ -492,11 +488,7 @@ impl Block {
                     || self.quorum_cert().verify(validator),
                 );
                 res1?;
-                res2?;
-                if let Some(primary_proof) = p.primary_proof() {
-                    primary_proof.verify(primary_proof_verifier)?;
-                }
-                Ok(())
+                res2
             },
             BlockType::DAGBlock { .. } => bail!("We should not accept DAG block from others"),
         }

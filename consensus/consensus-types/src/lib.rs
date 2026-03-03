@@ -17,7 +17,6 @@ pub mod payload;
 pub mod payload_pull_params;
 pub mod pipeline;
 pub mod pipelined_block;
-pub mod primary_consensus_proof;
 pub mod proof_of_store;
 pub mod proposal_ext;
 pub mod proposal_msg;

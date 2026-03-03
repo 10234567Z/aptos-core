@@ -4,7 +4,6 @@
 use crate::{
     common::{Author, Payload, Round},
     opt_block_data::OptBlockData,
-    primary_consensus_proof::PrimaryConsensusProof,
     proposal_ext::{OptBlockBody, ProposalExt},
     proxy_block_data::{OptProxyBlockBody, OptProxyBlockData},
     quorum_cert::QuorumCert,
@@ -224,26 +223,31 @@ impl BlockData {
 
     pub fn is_proxy_block(&self) -> bool {
         match &self.block_type {
-            BlockType::ProposalExt(p) => p.last_primary_proof_round().is_some(),
-            BlockType::OptimisticProposal(p) => p.last_primary_proof_round().is_some(),
+            BlockType::ProposalExt(ProposalExt::ProxyV0 { .. }) => true,
+            BlockType::OptimisticProposal(OptBlockBody::ProxyV0 { .. }) => true,
             _ => false,
         }
     }
 
-    /// Returns the last_primary_proof_round for proxy blocks.
-    pub fn last_primary_proof_round(&self) -> Option<Round> {
+    pub fn is_proxy_aggregated(&self) -> bool {
+        matches!(
+            &self.block_type,
+            BlockType::ProposalExt(ProposalExt::ProxyAggregatedV0 { .. })
+        )
+    }
+
+    /// Returns the last_proxy_round for proxy aggregated blocks.
+    pub fn last_proxy_round(&self) -> Option<Round> {
         match &self.block_type {
-            BlockType::ProposalExt(p) => p.last_primary_proof_round(),
-            BlockType::OptimisticProposal(p) => p.last_primary_proof_round(),
+            BlockType::ProposalExt(p) => p.last_proxy_round(),
             _ => None,
         }
     }
 
-    /// Returns the primary consensus proof attached to proxy blocks (if any).
-    pub fn primary_proof(&self) -> Option<&PrimaryConsensusProof> {
+    /// Returns the last_proxy_block_id for proxy aggregated blocks.
+    pub fn last_proxy_block_id(&self) -> Option<HashValue> {
         match &self.block_type {
-            BlockType::ProposalExt(p) => p.primary_proof(),
-            BlockType::OptimisticProposal(p) => p.primary_proof(),
+            BlockType::ProposalExt(p) => p.last_proxy_block_id(),
             _ => None,
         }
     }
@@ -464,8 +468,6 @@ impl BlockData {
             payload,
             author,
             grandparent_qc,
-            last_primary_proof_round,
-            primary_proof,
         } = block_body;
         Self {
             epoch,
@@ -477,8 +479,6 @@ impl BlockData {
                 payload,
                 author,
                 grandparent_qc,
-                last_primary_proof_round,
-                primary_proof,
             }),
         }
     }
@@ -495,8 +495,6 @@ impl BlockData {
         payload: Payload,
         author: Author,
         failed_authors: Vec<(Round, Author)>,
-        last_primary_proof_round: Round,
-        primary_proof: Option<PrimaryConsensusProof>,
     ) -> Self {
         Self {
             epoch,
@@ -508,8 +506,35 @@ impl BlockData {
                 payload,
                 author,
                 failed_authors,
-                last_primary_proof_round,
-                primary_proof,
+            }),
+        }
+    }
+
+    /// Creates a new proxy aggregated BlockData for primary blocks that aggregate proxy blocks.
+    /// Contains metadata linking back to the proxy block range that was aggregated.
+    pub fn new_proxy_aggregated(
+        validator_txns: Vec<ValidatorTransaction>,
+        payload: Payload,
+        author: Author,
+        failed_authors: Vec<(Round, Author)>,
+        round: Round,
+        timestamp_usecs: u64,
+        quorum_cert: QuorumCert,
+        last_proxy_round: Round,
+        last_proxy_block_id: HashValue,
+    ) -> Self {
+        Self {
+            epoch: quorum_cert.certified_block().epoch(),
+            round,
+            timestamp_usecs,
+            quorum_cert,
+            block_type: BlockType::ProposalExt(ProposalExt::ProxyAggregatedV0 {
+                validator_txns,
+                payload,
+                author,
+                failed_authors,
+                last_proxy_round,
+                last_proxy_block_id,
             }),
         }
     }

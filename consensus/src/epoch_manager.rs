@@ -55,7 +55,7 @@ use crate::{
     util::time_service::TimeService,
 };
 use crate::persistent_liveness_storage::ProxyLivenessStorage;
-use crate::proxy_hooks::{ProxyConsensusHooks, ProxyExecutionClient, ProxyHooksImpl};
+use crate::proxy_hooks::ProxyHooksImpl;
 use anyhow::{anyhow, bail, ensure, Context};
 use aptos_bounded_executor::BoundedExecutor;
 use aptos_channels::{aptos_channel, message_queues::QueueStyle};
@@ -1367,17 +1367,12 @@ impl<P: OnChainConfigProvider> EpochManager<P> {
             RoundState::new(proxy_time_interval, self.time_service.clone(), proxy_timeout_tx);
 
         // 6. Create ProxyHooksImpl (needed before BlockStore for ProxyExecutionClient)
-        // Bootstrap: initialize with the root QC (genesis QC certifying round 0) so the
-        // first proxy blocks can attach primary_proof and form a cutting point. Without this,
-        // primary waits for proxy ordered blocks while proxy can't find a cutting point.
-        let initial_primary_qc = Arc::new(recovery_data.root_quorum_cert().clone());
-        let has_pending_proof = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Leader-driven cutting: proxy blocks are pure BFT, no primary proof needed.
+        // Proxy unconditionally forwards all ordered blocks; primary leader decides cut.
         let pipeline_state = Arc::new(aptos_proxy_primary::AtomicPipelineState::new());
         let proxy_hooks = Arc::new(ProxyHooksImpl::new(
             proxy_to_primary_tx,
             broadcast_network_sender,
-            Some(initial_primary_qc),
-            has_pending_proof.clone(),
             self.author,
         ));
 
@@ -1520,25 +1515,19 @@ impl<P: OnChainConfigProvider> EpochManager<P> {
             "Proxy RoundManager created, spawning event loop"
         );
 
-        // 11. Spawn task to forward primary QC/TC events to proxy hooks
-        let hooks_for_events: Arc<dyn ProxyConsensusHooks> = proxy_hooks;
+        // 11. Spawn task to forward primary pipeline state events to proxy
         let pipeline_state_for_events = pipeline_state;
         tokio::spawn(async move {
             let mut rx = primary_to_proxy_rx;
             while let Some(event) = rx.recv().await {
                 match event {
-                    aptos_proxy_primary::PrimaryToProxyEvent::NewPrimaryQC(qc) => {
-                        hooks_for_events.update_primary_qc(qc);
-                    },
-                    aptos_proxy_primary::PrimaryToProxyEvent::NewPrimaryTC(tc) => {
-                        hooks_for_events.update_primary_tc(tc);
-                    },
                     aptos_proxy_primary::PrimaryToProxyEvent::PipelineState(info) => {
                         debug!(
                             pipeline_gap = info.pipeline_pending_round_gap,
                             pending_batches = info.pending_proxy_batches,
                             committed_round = info.primary_committed_round,
                             ordered_round = info.primary_ordered_round,
+                            last_consumed_proxy_round = info.last_consumed_proxy_round,
                             "[DIAG] Proxy received pipeline state update"
                         );
                         pipeline_state_for_events.store(&info);
@@ -2428,9 +2417,8 @@ impl<P: OnChainConfigProvider> EpochManager<P> {
                 // Dispatch to primary RoundManager via the proxy event channel
                 if let Some(ref tx) = self.proxy_ordered_blocks_tx {
                     debug!(
-                        "Dispatching OrderedProxyBlocksMsg with {} blocks for primary round {}",
+                        "Dispatching OrderedProxyBlocksMsg with {} blocks",
                         msg.proxy_blocks().len(),
-                        msg.primary_round()
                     );
                     let event =
                         aptos_proxy_primary::ProxyToPrimaryEvent::OrderedProxyBlocks(*msg);

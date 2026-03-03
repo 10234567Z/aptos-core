@@ -3,7 +3,6 @@
 
 use crate::{
     common::{Author, Payload, Round},
-    primary_consensus_proof::PrimaryConsensusProof,
     proposal_ext::OptBlockBody,
     quorum_cert::QuorumCert,
 };
@@ -62,8 +61,6 @@ impl OptBlockData {
         timestamp_usecs: u64,
         parent: BlockInfo,
         grandparent_qc: QuorumCert,
-        last_primary_proof_round: Round,
-        primary_proof: Option<PrimaryConsensusProof>,
     ) -> Self {
         Self {
             epoch,
@@ -75,8 +72,6 @@ impl OptBlockData {
                 payload,
                 author,
                 grandparent_qc,
-                last_primary_proof_round,
-                primary_proof,
             },
         }
     }
@@ -141,20 +136,6 @@ impl OptBlockData {
             self.timestamp_usecs() <= (current_ts.as_micros() as u64).saturating_add(TIMEBOUND),
             "Blocks must not be too far in the future"
         );
-
-        // Validate last_primary_proof_round consistency with attached proof.
-        // If proof is attached, proof.round must advance beyond the inherited lppr,
-        // and last_primary_proof_round must equal proof.round.
-        if let Some(lppr) = self.last_primary_proof_round() {
-            if let Some(primary_proof) = self.primary_proof() {
-                ensure!(
-                    primary_proof.proof_round() >= lppr,
-                    "Primary proof round {} must be >= last_primary_proof_round {}",
-                    primary_proof.proof_round(),
-                    lppr,
-                );
-            }
-        }
 
         Ok(())
     }

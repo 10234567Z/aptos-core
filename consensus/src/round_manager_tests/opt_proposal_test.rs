@@ -235,7 +235,6 @@ fn test_one_proposal_per_round_honest_proposer() {
             proposer_election.clone(),
             None,
             None,
-            0,
         )
         .await
         .unwrap_err();
@@ -258,7 +257,6 @@ fn test_one_proposal_per_round_honest_proposer() {
             proposer_election,
             None,
             None,
-            0,
         )
         .await
         .unwrap();

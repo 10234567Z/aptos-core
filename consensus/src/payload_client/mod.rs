@@ -37,9 +37,10 @@ pub trait PayloadClient: Send + Sync {
 /// quorum store returns immediately without the 30ms NO_TXN_DELAY sleep.
 ///
 /// The budget is determined by walking the proxy block chain backwards from the
-/// highest QC block to the last cutting point (a block with `primary_proof`).
-/// After `target` blocks with non-empty payloads, returns empty payloads so
-/// proxy consensus keeps running for ordering without adding more transactions.
+/// highest QC block to the last consumed proxy round (as reported by the primary
+/// via pipeline state). After `target` blocks with non-empty payloads, returns
+/// empty payloads so proxy consensus keeps running for ordering without adding
+/// more transactions.
 pub struct ProxyBudgetPayloadClient {
     /// Fast path: validator txns disabled (used most pulls).
     inner: Arc<dyn PayloadClient>,
@@ -85,15 +86,15 @@ impl ProxyBudgetPayloadClient {
         }
     }
 
-    /// Count proxy blocks since the last cutting point.
+    /// Count proxy blocks since the last consumed point.
     ///
     /// Walks backwards from the highest QC block (the parent of the block being
     /// proposed) through the proxy chain. Stops when it finds a block with
-    /// `primary_proof` (a cutting point marking the end of the previous batch)
+    /// `round <= last_consumed_proxy_round` (already consumed by primary)
     /// or runs out of blocks in the store.
     ///
     /// Returns (blocks_with_txns, total_blocks).
-    fn count_blocks_since_cutting_point(&self) -> (u64, u64) {
+    fn count_blocks_since_consumed(&self, last_consumed_proxy_round: u64) -> (u64, u64) {
         let hqc = self.proxy_block_store.highest_quorum_cert();
         let mut block_id = hqc.certified_block().id();
         let mut with_txns = 0u64;
@@ -105,8 +106,8 @@ impl ProxyBudgetPayloadClient {
                 None => break, // reached pruned history or genesis parent
             };
 
-            // Cutting point: this block has primary_proof, belongs to previous batch
-            if block.block().block_data().primary_proof().is_some() {
+            // Stop at blocks already consumed by the primary
+            if block.block().round() <= last_consumed_proxy_round {
                 break;
             }
 
@@ -131,8 +132,9 @@ impl PayloadClient for ProxyBudgetPayloadClient {
         validator_txn_filter: TransactionFilter,
     ) -> anyhow::Result<(Vec<ValidatorTransaction>, Payload), QuorumStoreError> {
         let pull_num = self.pull_count.fetch_add(1, Ordering::Relaxed);
-        let (blocks_with_txns, total_blocks) = self.count_blocks_since_cutting_point();
         let pipeline_info = self.pipeline_state.load();
+        let (blocks_with_txns, total_blocks) =
+            self.count_blocks_since_consumed(pipeline_info.last_consumed_proxy_round);
         let gap = pipeline_info.pipeline_pending_round_gap;
 
         proxy_metrics::PROXY_PIPELINE_PENDING_GAP.set(gap as i64);

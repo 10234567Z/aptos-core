@@ -58,7 +58,7 @@ use aptos_consensus_types::{
 };
 use aptos_crypto::{hash::CryptoHash, HashValue};
 use aptos_proxy_primary::{
-    PipelineBackpressureInfo, PrimaryBlockFromProxy, PrimaryToProxyEvent, ProxyToPrimaryEvent,
+    PipelineBackpressureInfo, PrimaryToProxyEvent, ProxyToPrimaryEvent,
 };
 use aptos_infallible::{checked, Mutex};
 use aptos_logger::prelude::*;
@@ -346,12 +346,12 @@ pub struct RoundManager {
     proposal_status_tracker: Arc<dyn TPastProposalStatusTracker>,
     pending_opt_proposals: BTreeMap<Round, OptBlockData>,
     opt_proposal_loopback_tx: aptos_channels::UnboundedSender<OptBlockData>,
-    // Proxy consensus integration: accumulated proxy block batches to be included in
-    // the next primary proposal. Multiple OrderedProxyBlocksMsgs accumulate here and
-    // are drained into a single merged payload when spawning proposal generation.
-    pending_proxy_blocks: Vec<PrimaryBlockFromProxy>,
-    // Highest primary_round consumed from proxy blocks. Used to reject stale/duplicate messages.
-    last_consumed_proxy_primary_round: Round,
+    // Proxy consensus integration: buffer of ordered proxy blocks indexed by proxy round.
+    // Blocks are inserted as they arrive from proxy consensus and consumed by the leader
+    // during proposal generation (leader-driven cutting).
+    pending_proxy_blocks: BTreeMap<Round, Arc<Block>>,
+    // Highest proxy round consumed (included in a proposal). Used to skip stale blocks.
+    last_consumed_proxy_round: Round,
     // Channel to send events (QC/TC updates) to proxy consensus
     proxy_event_tx: Option<TokioMpsc::UnboundedSender<PrimaryToProxyEvent>>,
     // When proxy consensus is active, store the new round event until proxy blocks arrive.
@@ -430,8 +430,8 @@ impl RoundManager {
             proposal_status_tracker,
             pending_opt_proposals: BTreeMap::new(),
             opt_proposal_loopback_tx,
-            pending_proxy_blocks: Vec::new(),
-            last_consumed_proxy_primary_round: 0,
+            pending_proxy_blocks: BTreeMap::new(),
+            last_consumed_proxy_round: 0,
             proxy_event_tx,
             pending_proposal_event: None,
             proxy_hooks,
@@ -571,7 +571,7 @@ impl RoundManager {
                         "Proxy consensus active, deferring proposal for round {} until proxy blocks arrive. \
                          last_consumed_proxy_round={}, commit_round={}, ordered_round={}, pipeline_gap={}",
                         new_round_event.round,
-                        self.last_consumed_proxy_primary_round,
+                        self.last_consumed_proxy_round,
                         commit_round,
                         ordered_round,
                         ordered_round.saturating_sub(commit_round),
@@ -587,65 +587,97 @@ impl RoundManager {
     }
 
     /// Spawn the proposal generation task (used by process_new_round_event).
-    /// Drains all accumulated proxy block batches and merges their payloads into
-    /// a single proposal. Each primary block includes ALL proxy blocks since its
-    /// parent, covering every OrderedProxyBlocksMsg that arrived.
+    ///
+    /// Leader-driven cutting: collects proxy blocks from `pending_proxy_blocks`
+    /// BTreeMap starting after the parent block's `last_proxy_round`, aggregates
+    /// their payloads, and passes the result to proposal generation.
     fn spawn_proposal_generation(&mut self, new_round_event: NewRoundEvent) {
-        // Drain all accumulated proxy block batches and merge their payloads.
-        let proxy_payload = if !self.pending_proxy_blocks.is_empty() {
-            let batched = std::mem::take(&mut self.pending_proxy_blocks);
-            let batched_count = batched.len();
-            for blocks in &batched {
-                if blocks.primary_round() > self.last_consumed_proxy_primary_round {
-                    self.last_consumed_proxy_primary_round = blocks.primary_round();
+        let sync_info = self.block_store.sync_info();
+        let proxy_hooks = self.proxy_hooks.clone();
+
+        // Leader-driven cut: determine which proxy blocks to include
+        let proxy_payload = if !self.pending_proxy_blocks.is_empty() && proxy_hooks.is_none() {
+            // Determine start: parent's last_proxy_round (if ProxyAggregatedV0) or 0
+            let parent_id = sync_info.highest_quorum_cert().certified_block().id();
+            let start_after = self
+                .block_store
+                .get_block(parent_id)
+                .and_then(|b| b.block().block_data().last_proxy_round())
+                .unwrap_or(0);
+
+            // Collect blocks from pending_proxy_blocks with round > start_after
+            // Always include at least one block.
+            use std::ops::Bound;
+            let blocks_to_include: Vec<Arc<Block>> = self
+                .pending_proxy_blocks
+                .range((Bound::Excluded(start_after), Bound::Unbounded))
+                .map(|(_, b)| b.clone())
+                .collect();
+
+            if blocks_to_include.is_empty() {
+                None
+            } else {
+                let last_block = blocks_to_include.last().expect("blocks_to_include is non-empty");
+                let last_proxy_round = last_block.round();
+                let last_proxy_block_id = last_block.id();
+
+                // Aggregate validator txns and payloads
+                let mut all_vtxns = Vec::new();
+                let mut merged_payload: Option<Payload> = None;
+                for block in &blocks_to_include {
+                    if let Some(vtxns) = block.validator_txns() {
+                        all_vtxns.extend(vtxns.iter().cloned());
+                    }
+                    if let Some(p) = block.payload().cloned() {
+                        if !p.is_empty() {
+                            merged_payload = Some(match merged_payload {
+                                Some(existing) => existing.extend(p),
+                                None => p,
+                            });
+                        }
+                    }
                 }
-            }
-            let mut all_vtxns = Vec::new();
-            let mut merged_payload: Option<Payload> = None;
-            for blocks in batched {
-                all_vtxns.extend(blocks.aggregate_validator_txns());
-                let p = blocks.aggregate_payloads();
-                if !p.is_empty() {
-                    merged_payload = Some(match merged_payload {
-                        Some(existing) => existing.extend(p),
-                        None => p,
-                    });
+                let payload = merged_payload.unwrap_or_else(|| Payload::empty(true, true));
+
+                // Update last_consumed_proxy_round
+                self.last_consumed_proxy_round = last_proxy_round;
+
+                // Remove consumed blocks from the buffer
+                let to_remove: Vec<Round> = self
+                    .pending_proxy_blocks
+                    .range(..=last_proxy_round)
+                    .map(|(r, _)| *r)
+                    .collect();
+                for r in to_remove {
+                    self.pending_proxy_blocks.remove(&r);
                 }
+
+                let payload_len = payload.len();
+                let payload_size = payload.size();
+                info!(
+                    "spawn_proposal_generation: aggregated {} proxy blocks, {} txns, {} bytes, \
+                     {} vtxns, last_proxy_round={}, last_consumed_proxy_round={}",
+                    blocks_to_include.len(), payload_len, payload_size, all_vtxns.len(),
+                    last_proxy_round, self.last_consumed_proxy_round,
+                );
+                aptos_proxy_primary::proxy_metrics::PROXY_AGGREGATED_PAYLOAD_SIZE
+                    .set(payload_len as i64);
+
+                // Send updated pipeline state to proxy
+                self.send_pipeline_state_to_proxy();
+
+                Some((all_vtxns, payload, last_proxy_round, last_proxy_block_id))
             }
-            let payload = merged_payload.unwrap_or_else(|| Payload::empty(true, true));
-            let payload_len = payload.len();
-            let payload_size = payload.size();
-            let num_batches = batched_count;
-            info!(
-                "spawn_proposal_generation: merged proxy payload: {} txns, {} bytes, {} vtxns, \
-                 {} proxy batches merged, last_consumed_proxy_round={}",
-                payload_len, payload_size, all_vtxns.len(),
-                num_batches, self.last_consumed_proxy_primary_round,
-            );
-            aptos_proxy_primary::proxy_metrics::PROXY_AGGREGATED_PAYLOAD_SIZE
-                .set(payload_len as i64);
-            Some((all_vtxns, payload))
         } else {
             None
         };
+
         let epoch_state = self.epoch_state.clone();
         let network = self.network.clone();
-        let sync_info = self.block_store.sync_info();
         let proposal_generator = self.proposal_generator.clone();
         let safety_rules = self.safety_rules.clone();
         let proposer_election = self.proposer_election.clone();
-        let proxy_hooks = self.proxy_hooks.clone();
         let consensus_type = self.consensus_type();
-        // Compute parent's last_primary_proof_round for proxy block proposals
-        let parent_lppr = if proxy_hooks.is_some() {
-            let parent_id = sync_info.highest_quorum_cert().certified_block().id();
-            self.block_store
-                .get_block(parent_id)
-                .and_then(|b| b.block().block_data().last_primary_proof_round())
-                .unwrap_or(0)
-        } else {
-            0
-        };
         tokio::spawn(async move {
             if let Err(e) = monitor!(
                 "generate_and_send_proposal",
@@ -659,7 +691,6 @@ impl RoundManager {
                     proposer_election,
                     proxy_hooks,
                     proxy_payload,
-                    parent_lppr,
                 )
                 .await
             ) {
@@ -677,8 +708,7 @@ impl RoundManager {
         safety_rules: Arc<Mutex<MetricsSafetyRules>>,
         proposer_election: Arc<dyn ProposerElection + Send + Sync>,
         proxy_hooks: Option<Arc<dyn crate::proxy_hooks::ProxyConsensusHooks>>,
-        proxy_payload: Option<(Vec<aptos_types::validator_txn::ValidatorTransaction>, aptos_consensus_types::common::Payload)>,
-        parent_last_primary_proof_round: Round,
+        proxy_payload: Option<(Vec<aptos_types::validator_txn::ValidatorTransaction>, aptos_consensus_types::common::Payload, Round, HashValue)>,
     ) -> anyhow::Result<()> {
         let consensus_type = if proxy_hooks.is_some() { "proxy" } else { "primary" };
         Self::log_collected_vote_stats(epoch_state.clone(), &new_round_event, consensus_type);
@@ -691,7 +721,6 @@ impl RoundManager {
             proposer_election,
             proxy_hooks,
             proxy_payload,
-            parent_last_primary_proof_round,
         )
         .await?;
         #[cfg(feature = "failpoints")]
@@ -745,7 +774,6 @@ impl RoundManager {
         proposal_generator: Arc<ProposalGenerator>,
         proposer_election: Arc<dyn ProposerElection + Send + Sync>,
         proxy_hooks: Arc<dyn crate::proxy_hooks::ProxyConsensusHooks>,
-        parent_last_primary_proof_round: Round,
     ) -> anyhow::Result<()> {
         let (validator_txns, payload, timestamp) = proposal_generator
             .generate_opt_proposal_payload(round, parent.id(), proposer_election)
@@ -760,7 +788,6 @@ impl RoundManager {
             timestamp,
             parent,
             grandparent_qc,
-            parent_last_primary_proof_round,
         );
 
         // This is always a proxy opt proposal
@@ -873,7 +900,6 @@ impl RoundManager {
             self.proposer_election.clone(),
             None,
             None,
-            0, // parent_last_primary_proof_round: not needed for non-proxy
         )
         .await
     }
@@ -886,8 +912,7 @@ impl RoundManager {
         safety_rules: Arc<Mutex<MetricsSafetyRules>>,
         proposer_election: Arc<dyn ProposerElection + Send + Sync>,
         proxy_hooks: Option<Arc<dyn crate::proxy_hooks::ProxyConsensusHooks>>,
-        proxy_payload: Option<(Vec<aptos_types::validator_txn::ValidatorTransaction>, aptos_consensus_types::common::Payload)>,
-        parent_last_primary_proof_round: Round,
+        proxy_payload: Option<(Vec<aptos_types::validator_txn::ValidatorTransaction>, aptos_consensus_types::common::Payload, Round, HashValue)>,
     ) -> anyhow::Result<ProposalMsg> {
         let consensus_type = if proxy_hooks.is_some() { "proxy" } else { "primary" };
         let proposal = if let Some(hooks) = proxy_hooks {
@@ -909,9 +934,8 @@ impl RoundManager {
                 original.round(),
                 original.timestamp_usecs(),
                 original.quorum_cert().clone(),
-                parent_last_primary_proof_round,
             )
-        } else if let Some((vtxns, payload)) = proxy_payload {
+        } else if let Some((vtxns, payload, last_proxy_round, last_proxy_block_id)) = proxy_payload {
             // Primary RoundManager with proxy payload: use aggregated proxy transactions
             // Primary adds zero new transactions — block content comes entirely from proxy blocks
             proposal_generator
@@ -920,6 +944,8 @@ impl RoundManager {
                     proposer_election,
                     vtxns,
                     payload,
+                    last_proxy_round,
+                    last_proxy_block_id,
                 )
                 .await?
         } else {
@@ -1265,7 +1291,7 @@ impl RoundManager {
             has_deferred_proposal = has_deferred_proposal,
             pending_proxy_batches = pending_proxy_batches,
             is_proxy_active = is_proxy_active,
-            last_consumed_proxy_round = self.last_consumed_proxy_primary_round,
+            last_consumed_proxy_round = self.last_consumed_proxy_round,
             "[DIAG] Local timeout context"
         );
 
@@ -1761,12 +1787,6 @@ impl RoundManager {
             if let Some(ref proxy_hooks) = self.proxy_hooks {
                 // Proxy path: generate opt proxy proposal with ProxyV0 body
                 let proxy_hooks = proxy_hooks.clone();
-                // Look up parent's last_primary_proof_round from block store
-                let parent_lppr = self
-                    .block_store
-                    .get_block(parent.id())
-                    .and_then(|b| b.block().block_data().last_primary_proof_round())
-                    .unwrap_or(0);
                 tokio::spawn(async move {
                     if let Err(e) = monitor!(
                         "generate_and_send_opt_proxy_proposal",
@@ -1780,7 +1800,6 @@ impl RoundManager {
                             proposal_generator,
                             proposer_election,
                             proxy_hooks,
-                            parent_lppr,
                         )
                         .await
                     ) {
@@ -2268,8 +2287,8 @@ impl RoundManager {
             .insert_quorum_cert(&qc, &mut self.create_block_retriever(preferred_peer))
             .await
             .context("[RoundManager] Failed to process a newly aggregated QC");
-        // Notify proxy consensus of new QC
-        self.notify_proxy_of_qc(qc);
+        // Piggyback pipeline state on QC events for proxy backpressure
+        self.send_pipeline_state_to_proxy();
         self.process_certificates().await?;
         result
     }
@@ -2294,8 +2313,8 @@ impl RoundManager {
                     )
                     .await
                     .context("[RoundManager] Failed to process the QC from order vote msg");
-                // Notify proxy consensus of new QC (same as new_qc_aggregated)
-                self.notify_proxy_of_qc(verified_qc);
+                // Piggyback pipeline state on QC events for proxy backpressure
+                self.send_pipeline_state_to_proxy();
                 self.process_certificates().await?;
                 result
             },
@@ -2350,8 +2369,8 @@ impl RoundManager {
             .block_store
             .insert_2chain_timeout_certificate(tc.clone())
             .context("[RoundManager] Failed to process a newly aggregated 2-chain TC");
-        // Notify proxy consensus of new TC
-        self.notify_proxy_of_tc(tc);
+        // Piggyback pipeline state on TC events for proxy backpressure
+        self.send_pipeline_state_to_proxy();
         self.process_certificates().await?;
         result
     }
@@ -2362,78 +2381,74 @@ impl RoundManager {
 
     /// Process ordered proxy blocks message from proxy consensus.
     ///
-    /// This message contains proxy blocks that have been ordered by proxy consensus
-    /// and are ready to be included in a primary block.
+    /// This message contains proxy blocks that have been ordered by proxy consensus.
+    /// Each block is individually verified and inserted into the `pending_proxy_blocks`
+    /// BTreeMap (keyed by proxy round), deduplicating naturally.
     async fn process_ordered_proxy_blocks_msg(
         &mut self,
         msg: OrderedProxyBlocksMsg,
     ) -> anyhow::Result<()> {
-        let primary_round = msg.primary_round();
         let num_blocks = msg.proxy_blocks().len();
         let has_deferred = self.pending_proposal_event.is_some();
         let current_round = self.round_state().current_round();
 
         info!(
             self.new_log(LogEvent::ReceiveNewCertificate),
-            "Received {} ordered proxy blocks for primary round {}. \
-             current_round={}, has_deferred_proposal={}, pending_batches={}, \
+            "Received {} ordered proxy blocks. \
+             current_round={}, has_deferred_proposal={}, pending_buffer={}, \
              last_consumed_proxy_round={}",
             num_blocks,
-            primary_round,
             current_round,
             has_deferred,
             self.pending_proxy_blocks.len(),
-            self.last_consumed_proxy_primary_round,
+            self.last_consumed_proxy_round,
         );
-
-        // Reject stale or duplicate messages
-        if primary_round <= self.last_consumed_proxy_primary_round {
-            info!(
-                self.new_log(LogEvent::ReceiveNewCertificate),
-                "Ignoring stale proxy blocks for primary round {} (last consumed: {})",
-                primary_round,
-                self.last_consumed_proxy_primary_round,
-            );
-            return Ok(());
-        }
-
-        // Convert to PrimaryBlockFromProxy
-        let primary_block_from_proxy = PrimaryBlockFromProxy::from_ordered_msg(msg)
-            .context("[RoundManager] Failed to parse ordered proxy blocks")?;
 
         // Verify the proxy blocks using proxy-only verifier (proxy QCs are signed by proxy subset)
         let verifier = self
             .proxy_verifier
             .as_ref()
             .expect("[RoundManager] proxy_verifier must be set when receiving ordered proxy blocks");
-        primary_block_from_proxy
-            .verify(verifier, &self.epoch_state.verifier)
-            .context("[RoundManager] Failed to verify ordered proxy blocks")?;
+
+        let was_empty = self.pending_proxy_blocks.is_empty();
+        let mut inserted = 0usize;
+
+        for block in msg.take_proxy_blocks() {
+            // Skip stale blocks already consumed
+            if block.round() <= self.last_consumed_proxy_round {
+                continue;
+            }
+
+            // Verify block signature
+            block
+                .validate_signature(verifier)
+                .context("[RoundManager] Failed to verify proxy block signature")?;
+
+            // Insert into BTreeMap (deduplicates by round)
+            self.pending_proxy_blocks
+                .entry(block.round())
+                .or_insert_with(|| {
+                    inserted += 1;
+                    Arc::new(block)
+                });
+        }
 
         info!(
             self.new_log(LogEvent::ReceiveNewCertificate),
-            "Verified {} proxy blocks for primary round {}, payload hash: {}",
-            primary_block_from_proxy.num_blocks(),
-            primary_block_from_proxy.primary_round(),
-            primary_block_from_proxy.aggregated_payload_hash(),
+            "Inserted {} new proxy blocks into buffer (total: {})",
+            inserted,
+            self.pending_proxy_blocks.len(),
         );
-
-        // Accumulate proxy blocks. Multiple batches may arrive between primary rounds;
-        // all will be drained and merged when the next proposal is generated.
-        let was_empty = self.pending_proxy_blocks.is_empty();
-        self.pending_proxy_blocks.push(primary_block_from_proxy);
 
         // Send pipeline state to proxy so it can adjust backpressure
         self.send_pipeline_state_to_proxy();
 
-        // Trigger deferred proposal only on the first message arrival.
-        // Subsequent messages accumulate and will be included in the same proposal.
-        if was_empty {
+        // Trigger deferred proposal when buffer goes from empty to non-empty.
+        if was_empty && !self.pending_proxy_blocks.is_empty() {
             if let Some(event) = self.pending_proposal_event.take() {
                 info!(
                     self.new_log(LogEvent::NewRound),
-                    "Proxy blocks arrived for primary round {}, generating deferred proposal for round {}",
-                    primary_round,
+                    "Proxy blocks arrived, generating deferred proposal for round {}",
                     event.round,
                 );
                 self.spawn_proposal_generation(event);
@@ -2441,52 +2456,6 @@ impl RoundManager {
         }
 
         Ok(())
-    }
-
-    /// Notify proxy consensus of a newly aggregated QC.
-    ///
-    /// Called when we form a QC, so proxy can attach it to the next proxy block
-    /// and trigger forwarding of ordered blocks.
-    fn notify_proxy_of_qc(&self, qc: Arc<QuorumCert>) {
-        if let Some(ref tx) = self.proxy_event_tx {
-            let event = PrimaryToProxyEvent::NewPrimaryQC(qc.clone());
-            if let Err(e) = tx.send(event) {
-                warn!(
-                    "Failed to notify proxy of new QC (round {}): {}",
-                    qc.certified_block().round(),
-                    e
-                );
-            } else {
-                let commit_round = self.block_store.commit_root().round();
-                let ordered_round = self.block_store.ordered_root().round();
-                info!(
-                    "Notified proxy of new QC for round {}, pending_proxy_batches={}, pipeline_gap={}",
-                    qc.certified_block().round(),
-                    self.pending_proxy_blocks.len(),
-                    ordered_round.saturating_sub(commit_round),
-                );
-            }
-            // Piggyback pipeline state on every QC notification
-            self.send_pipeline_state_to_proxy();
-        }
-    }
-
-    /// Notify proxy consensus of a newly aggregated TC.
-    ///
-    /// Called when we form a TC, so proxy knows about timeout events.
-    fn notify_proxy_of_tc(&self, tc: Arc<TwoChainTimeoutCertificate>) {
-        if let Some(ref tx) = self.proxy_event_tx {
-            let event = PrimaryToProxyEvent::NewPrimaryTC(tc.clone());
-            if let Err(e) = tx.send(event) {
-                warn!(
-                    "Failed to notify proxy of new TC (round {}): {}",
-                    tc.round(),
-                    e
-                );
-            } else {
-                info!("Notified proxy of new TC for round {}", tc.round());
-            }
-        }
     }
 
     /// Send current pipeline state to proxy for backpressure decisions.
@@ -2502,6 +2471,7 @@ impl RoundManager {
                 pending_proxy_batches: self.pending_proxy_blocks.len() as u64,
                 primary_committed_round: commit_round,
                 primary_ordered_round: ordered_round,
+                last_consumed_proxy_round: self.last_consumed_proxy_round,
                 timestamp_ms: aptos_infallible::duration_since_epoch().as_millis() as u64,
             };
             // Advisory — ok to drop if channel is full
@@ -2569,7 +2539,7 @@ impl RoundManager {
         loop {
             // Handle optional proxy events. Each message is processed in order;
             // duplicates (N validators broadcast per round) are rejected by the
-            // last_consumed_proxy_primary_round stale check inside
+            // last_consumed_proxy_round stale check inside
             // process_ordered_proxy_blocks_msg. No skipping — every distinct
             // primary_round must be processed to preserve safety.
             let proxy_event_future = async {
@@ -2708,7 +2678,7 @@ impl RoundManager {
                 // Handle proxy consensus events at lowest priority so votes/timeouts
                 // are never starved. Messages accumulate in pending_proxy_blocks and
                 // are batched into the next primary proposal.
-                // Duplicates are rejected by last_consumed_proxy_primary_round.
+                // Duplicates are rejected by last_consumed_proxy_round.
                 Some(msg) = proxy_event_future => {
                     let result = monitor!(
                         "process_ordered_proxy_blocks",

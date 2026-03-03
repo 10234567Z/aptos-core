@@ -562,13 +562,15 @@ impl ProposalGenerator {
     ///
     /// Unlike `generate_proposal()`, this skips `payload_client.pull_payload()`.
     /// The primary block carries only transactions aggregated from proxy blocks,
-    /// adding zero new transactions.
+    /// adding zero new transactions. Creates a `ProxyAggregatedV0` block type.
     pub async fn generate_proposal_with_proxy_payload(
         &self,
         round: Round,
         proposer_election: Arc<dyn ProposerElection + Send + Sync>,
         proxy_validator_txns: Vec<ValidatorTransaction>,
         proxy_payload: Payload,
+        last_proxy_round: Round,
+        last_proxy_block_id: aptos_crypto::HashValue,
     ) -> anyhow::Result<BlockData> {
         let hqc = self.ensure_highest_quorum_cert(round)?;
 
@@ -610,29 +612,21 @@ impl ProposalGenerator {
 
         info!(
             round = round,
-            "ProposalGenerator: creating primary proposal with proxy payload"
+            last_proxy_round = last_proxy_round,
+            "ProposalGenerator: creating primary proposal with proxy payload (ProxyAggregatedV0)"
         );
 
-        let block = if self.vtxn_config.enabled() {
-            BlockData::new_proposal_ext(
-                validator_txns,
-                payload,
-                self.author,
-                failed_authors,
-                round,
-                timestamp,
-                quorum_cert,
-            )
-        } else {
-            BlockData::new_proposal(
-                payload,
-                self.author,
-                failed_authors,
-                round,
-                timestamp,
-                quorum_cert,
-            )
-        };
+        let block = BlockData::new_proxy_aggregated(
+            validator_txns,
+            payload,
+            self.author,
+            failed_authors,
+            round,
+            timestamp,
+            quorum_cert,
+            last_proxy_round,
+            last_proxy_block_id,
+        );
 
         Ok(block)
     }

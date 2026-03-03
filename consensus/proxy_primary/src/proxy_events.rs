@@ -4,18 +4,13 @@
 //! Event types for communication between primary and proxy consensus.
 //!
 //! These are used by the primary RoundManager and proxy RoundManager to
-//! exchange QC/TC updates and ordered proxy blocks.
+//! exchange pipeline state and ordered proxy blocks.
 
 use aptos_consensus_types::{
     common::Round,
     proxy_messages::OrderedProxyBlocksMsg,
-    quorum_cert::QuorumCert,
-    timeout_2chain::TwoChainTimeoutCertificate,
 };
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Pipeline backpressure state from the primary execution pipeline.
 ///
@@ -37,6 +32,9 @@ pub struct PipelineBackpressureInfo {
     pub primary_committed_round: Round,
     /// The primary round most recently ordered.
     pub primary_ordered_round: Round,
+    /// The last proxy round consumed by the primary (included in a proposal).
+    /// Used by the proxy budget payload client to determine the cutting point.
+    pub last_consumed_proxy_round: Round,
     /// Timestamp (epoch ms) when this info was generated.
     pub timestamp_ms: u64,
 }
@@ -48,6 +46,7 @@ pub struct AtomicPipelineState {
     pending_proxy_batches: AtomicU64,
     primary_committed_round: AtomicU64,
     primary_ordered_round: AtomicU64,
+    last_consumed_proxy_round: AtomicU64,
     last_update_ms: AtomicU64,
 }
 
@@ -58,6 +57,7 @@ impl AtomicPipelineState {
             pending_proxy_batches: AtomicU64::new(0),
             primary_committed_round: AtomicU64::new(0),
             primary_ordered_round: AtomicU64::new(0),
+            last_consumed_proxy_round: AtomicU64::new(0),
             last_update_ms: AtomicU64::new(0),
         }
     }
@@ -71,6 +71,8 @@ impl AtomicPipelineState {
             .store(info.primary_committed_round, Ordering::Release);
         self.primary_ordered_round
             .store(info.primary_ordered_round, Ordering::Release);
+        self.last_consumed_proxy_round
+            .store(info.last_consumed_proxy_round, Ordering::Release);
         self.last_update_ms
             .store(info.timestamp_ms, Ordering::Release);
     }
@@ -81,6 +83,7 @@ impl AtomicPipelineState {
             pending_proxy_batches: self.pending_proxy_batches.load(Ordering::Acquire),
             primary_committed_round: self.primary_committed_round.load(Ordering::Acquire),
             primary_ordered_round: self.primary_ordered_round.load(Ordering::Acquire),
+            last_consumed_proxy_round: self.last_consumed_proxy_round.load(Ordering::Acquire),
             timestamp_ms: self.last_update_ms.load(Ordering::Acquire),
         }
     }
@@ -89,10 +92,6 @@ impl AtomicPipelineState {
 /// Events sent from primary RoundManager to proxy RoundManager.
 #[derive(Debug)]
 pub enum PrimaryToProxyEvent {
-    /// New primary QC available - may trigger proxy block "cutting"
-    NewPrimaryQC(Arc<QuorumCert>),
-    /// New primary TC available - for tracking primary round
-    NewPrimaryTC(Arc<TwoChainTimeoutCertificate>),
     /// Periodic pipeline state for backpressure decisions
     PipelineState(PipelineBackpressureInfo),
     /// Shutdown signal

@@ -8,16 +8,15 @@
 
 use crate::{
     block::Block,
-    common::{Author, Round},
+    common::Author,
     opt_block_data::OptBlockData,
     order_vote::OrderVote,
-    primary_consensus_proof::PrimaryConsensusProof,
     proof_of_store::ProofCache,
     proxy_sync_info::ProxySyncInfo,
     quorum_cert::QuorumCert,
     vote::Vote,
 };
-use anyhow::{ensure, format_err, Context, Result};
+use anyhow::{ensure, Context, Result};
 use aptos_short_hex_str::AsShortHexStr;
 use aptos_types::validator_verifier::ValidatorVerifier;
 use serde::{Deserialize, Serialize};
@@ -127,14 +126,14 @@ impl ProxyProposalMsg {
             || {
                 self.proposal()
                     .validate_signature(validator)
-                    .map_err(|e| format_err!("{:?}", e))
+                    .map_err(|e| anyhow::format_err!("{:?}", e))
             },
         );
         payload_result?;
         sig_result?;
 
         if let Some(tc) = self.sync_info.highest_proxy_timeout_cert() {
-            tc.verify(validator).map_err(|e| format_err!("{:?}", e))?;
+            tc.verify(validator).map_err(|e| anyhow::format_err!("{:?}", e))?;
         }
 
         self.verify_well_formed()
@@ -228,13 +227,6 @@ impl OptProxyProposalMsg {
             .payload()
             .verify(validator, proof_cache, quorum_store_enabled, false)
             .context("Failed to verify payload")?;
-
-        // Verify primary proof (QC or TC) if attached
-        if let Some(primary_proof) = self.block_data.primary_proof() {
-            primary_proof
-                .verify(validator)
-                .context("Failed to verify attached primary proof")?;
-        }
 
         self.verify_well_formed()
     }
@@ -405,27 +397,19 @@ impl Display for ProxyRoundTimeoutMsg {
 // OrderedProxyBlocksMsg - Forwarded to all primaries
 // ============================================================================
 
-/// OrderedProxyBlocksMsg contains ordered proxy blocks ending at a cutting point.
+/// OrderedProxyBlocksMsg contains ordered proxy blocks.
 /// This is broadcast to ALL primaries (not just proxies) when proxy blocks are ordered.
+/// With leader-driven cutting, proxy forwards ALL ordered blocks unconditionally;
+/// the primary leader decides where to cut at proposal time.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct OrderedProxyBlocksMsg {
     /// Ordered proxy blocks linked by parent hashes.
-    /// last_primary_proof_round is non-decreasing across blocks.
     proxy_blocks: Vec<Block>,
-    /// The primary consensus proof (QC or TC) that "cut" these proxy blocks.
-    /// Primary round for this batch = proof.proof_round() + 1.
-    primary_proof: PrimaryConsensusProof,
 }
 
 impl OrderedProxyBlocksMsg {
-    pub fn new(
-        proxy_blocks: Vec<Block>,
-        primary_proof: PrimaryConsensusProof,
-    ) -> Self {
-        Self {
-            proxy_blocks,
-            primary_proof,
-        }
+    pub fn new(proxy_blocks: Vec<Block>) -> Self {
+        Self { proxy_blocks }
     }
 
     pub fn proxy_blocks(&self) -> &[Block] {
@@ -436,17 +420,12 @@ impl OrderedProxyBlocksMsg {
         self.proxy_blocks
     }
 
-    /// The primary round this batch belongs to, derived from the proof.
-    pub fn primary_round(&self) -> Round {
-        self.primary_proof.proof_round() + 1
-    }
-
-    pub fn primary_proof(&self) -> &PrimaryConsensusProof {
-        &self.primary_proof
-    }
-
+    /// The epoch derived from the first block.
     pub fn epoch(&self) -> u64 {
-        self.primary_proof.epoch()
+        self.proxy_blocks
+            .first()
+            .map(|b| b.epoch())
+            .unwrap_or(0)
     }
 
     /// Verify the ordered proxy blocks are well-formed and properly linked.
@@ -456,21 +435,12 @@ impl OrderedProxyBlocksMsg {
             "OrderedProxyBlocksMsg must contain at least one proxy block"
         );
 
-        // Verify all blocks are proxy blocks with non-decreasing last_primary_proof_round
-        let mut prev_lppr = 0;
+        // Verify all blocks are proxy blocks
         for block in &self.proxy_blocks {
             ensure!(
                 block.block_data().is_proxy_block(),
                 "OrderedProxyBlocksMsg contains non-proxy block"
             );
-            let lppr = block.block_data().last_primary_proof_round().unwrap_or(0);
-            ensure!(
-                lppr >= prev_lppr,
-                "last_primary_proof_round must be non-decreasing: {} < {}",
-                lppr,
-                prev_lppr,
-            );
-            prev_lppr = lppr;
         }
 
         // Verify blocks are linked by parent hashes (chain structure)
@@ -485,20 +455,6 @@ impl OrderedProxyBlocksMsg {
             );
         }
 
-        // Verify the last block has the primary proof attached
-        let last_block = self.proxy_blocks.last().unwrap();
-        ensure!(
-            last_block.block_data().primary_proof().is_some(),
-            "Last proxy block must have primary proof attached"
-        );
-        ensure!(
-            last_block.block_data().primary_proof().unwrap().proof_round()
-                == self.primary_proof.proof_round(),
-            "Last proxy block's primary proof round {} doesn't match message's primary proof round {}",
-            last_block.block_data().primary_proof().unwrap().proof_round(),
-            self.primary_proof.proof_round(),
-        );
-
         // Verify block signatures
         for block in &self.proxy_blocks {
             block
@@ -512,12 +468,14 @@ impl OrderedProxyBlocksMsg {
 
 impl Display for OrderedProxyBlocksMsg {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let first_round = self.proxy_blocks.first().map(|b| b.round()).unwrap_or(0);
+        let last_round = self.proxy_blocks.last().map(|b| b.round()).unwrap_or(0);
         write!(
             f,
-            "OrderedProxyBlocksMsg: [primary_round: {}, num_blocks: {}, proof: {}]",
-            self.primary_round(),
+            "OrderedProxyBlocksMsg: [num_blocks: {}, rounds: {}..{}]",
             self.proxy_blocks.len(),
-            self.primary_proof,
+            first_round,
+            last_round,
         )
     }
 }
@@ -528,22 +486,8 @@ mod tests {
 
     #[test]
     fn test_ordered_proxy_blocks_msg_creation() {
-        use crate::vote_data::VoteData;
-        use aptos_crypto::HashValue;
-        use aptos_types::{
-            aggregate_signature::AggregateSignature,
-            block_info::BlockInfo,
-            ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
-        };
-
-        let block_info = BlockInfo::new(1, 0, HashValue::random(), HashValue::random(), 0, 0, None);
-        let vote_data = VoteData::new(block_info.clone(), block_info.clone());
-        let ledger_info = LedgerInfo::new(block_info, HashValue::zero());
-        let li_sig = LedgerInfoWithSignatures::new(ledger_info, AggregateSignature::empty());
-        let qc = QuorumCert::new(vote_data, li_sig);
-
-        let msg = OrderedProxyBlocksMsg::new(vec![], PrimaryConsensusProof::QC(qc));
-        assert_eq!(msg.primary_round(), 1); // proof.round=0, so primary_round=1
+        let msg = OrderedProxyBlocksMsg::new(vec![]);
         assert!(msg.proxy_blocks().is_empty());
+        assert_eq!(msg.epoch(), 0);
     }
 }
