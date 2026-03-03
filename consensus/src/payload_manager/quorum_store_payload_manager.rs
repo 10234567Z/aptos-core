@@ -123,6 +123,42 @@ impl QuorumStorePayloadManager {
 }
 
 impl QuorumStorePayloadManager {
+    fn extract_batch_infos(payload: Payload) -> Vec<BatchInfoExt> {
+        match payload {
+            Payload::DirectMempool(_) => Vec::new(),
+            Payload::InQuorumStore(proof_with_status) => proof_with_status
+                .proofs
+                .iter()
+                .map(|proof| proof.info().clone().into())
+                .collect(),
+            Payload::InQuorumStoreWithLimit(proof_with_status) => proof_with_status
+                .proof_with_data
+                .proofs
+                .iter()
+                .map(|proof| proof.info().clone().into())
+                .collect(),
+            Payload::QuorumStoreInlineHybrid(inline_batches, proof_with_data, _)
+            | Payload::QuorumStoreInlineHybridV2(inline_batches, proof_with_data, _) => {
+                inline_batches
+                    .iter()
+                    .map(|(batch_info, _)| batch_info.clone().into())
+                    .chain(
+                        proof_with_data
+                            .proofs
+                            .iter()
+                            .map(|proof| proof.info().clone().into()),
+                    )
+                    .collect()
+            },
+            Payload::OptQuorumStore(OptQuorumStorePayload::V1(p)) => p.get_all_batch_infos(),
+            Payload::OptQuorumStore(OptQuorumStorePayload::V2(p)) => p.get_all_batch_infos(),
+            Payload::OrderedPayloads(payloads) => payloads
+                .into_iter()
+                .flat_map(Self::extract_batch_infos)
+                .collect(),
+        }
+    }
+
     async fn get_transactions_quorum_store_inline_hybrid(
         &self,
         block: &Block,
@@ -201,6 +237,10 @@ impl TPayloadManager for QuorumStorePayloadManager {
                 },
                 Payload::OptQuorumStore(OptQuorumStorePayload::V1(p)) => p.get_all_batch_infos(),
                 Payload::OptQuorumStore(OptQuorumStorePayload::V2(p)) => p.get_all_batch_infos(),
+                Payload::OrderedPayloads(payloads) => payloads
+                    .into_iter()
+                    .flat_map(|sub| Self::extract_batch_infos(sub))
+                    .collect(),
             })
             .collect();
 
@@ -301,6 +341,11 @@ impl TPayloadManager for QuorumStorePayloadManager {
                     timestamp,
                     &self.ordered_authors,
                 )
+            },
+            Payload::OrderedPayloads(payloads) => {
+                for sub in payloads {
+                    self.prefetch_payload_data(sub, author, timestamp);
+                }
             },
         };
     }
@@ -440,6 +485,10 @@ impl TPayloadManager for QuorumStorePayloadManager {
                     Err(missing_authors)
                 }
             },
+            Payload::OrderedPayloads(_) => {
+                // Sub-payloads contain proofs and inline batches, which are always available.
+                Ok(())
+            },
         }
     }
 
@@ -573,6 +622,122 @@ impl TPayloadManager for QuorumStorePayloadManager {
                     batch_infos,
                 )
             },
+            Payload::OrderedPayloads(payloads) => {
+                let mut all_txns = Vec::new();
+                let mut all_proofs = Vec::new();
+                let mut all_inline_batch_infos = Vec::new();
+                for sub_payload in payloads {
+                    match sub_payload {
+                        Payload::QuorumStoreInlineHybrid(
+                            inline_batches,
+                            proof_with_data,
+                            _,
+                        )
+                        | Payload::QuorumStoreInlineHybridV2(
+                            inline_batches,
+                            proof_with_data,
+                            _,
+                        ) => {
+                            let mut proof_txns = process_qs_payload(
+                                proof_with_data,
+                                self.batch_reader.clone(),
+                                block,
+                                &self.ordered_authors,
+                            )
+                            .await?;
+                            let inline_txns: Vec<_> = inline_batches
+                                .iter()
+                                .flat_map(|(_, txns)| txns.clone())
+                                .collect();
+                            all_txns.append(&mut proof_txns);
+                            all_txns.extend(inline_txns);
+                            all_proofs.extend(proof_with_data.proofs.clone());
+                            all_inline_batch_infos.extend(
+                                inline_batches.iter().map(|(info, _)| info.clone()),
+                            );
+                        },
+                        Payload::InQuorumStore(proof_with_data) => {
+                            let mut txns = process_qs_payload(
+                                proof_with_data,
+                                self.batch_reader.clone(),
+                                block,
+                                &self.ordered_authors,
+                            )
+                            .await?;
+                            all_txns.append(&mut txns);
+                            all_proofs.extend(proof_with_data.proofs.clone());
+                        },
+                        Payload::InQuorumStoreWithLimit(proof_with_data) => {
+                            let mut txns = process_qs_payload(
+                                &proof_with_data.proof_with_data,
+                                self.batch_reader.clone(),
+                                block,
+                                &self.ordered_authors,
+                            )
+                            .await?;
+                            all_txns.append(&mut txns);
+                            all_proofs
+                                .extend(proof_with_data.proof_with_data.proofs.clone());
+                        },
+                        Payload::OptQuorumStore(OptQuorumStorePayload::V1(p)) => {
+                            let mut proof_txns = process_optqs_payload(
+                                p.proof_with_data(),
+                                self.batch_reader.clone(),
+                                block,
+                                &self.ordered_authors,
+                                None,
+                            )
+                            .await?;
+                            let mut opt_txns = process_optqs_payload(
+                                p.opt_batches(),
+                                self.batch_reader.clone(),
+                                block,
+                                &self.ordered_authors,
+                                block_signers.as_ref(),
+                            )
+                            .await?;
+                            let inline_txns = p.inline_batches().transactions();
+                            all_txns.append(&mut proof_txns);
+                            all_txns.append(&mut opt_txns);
+                            all_txns.extend(inline_txns);
+                        },
+                        Payload::OptQuorumStore(OptQuorumStorePayload::V2(p)) => {
+                            let mut proof_txns = process_optqs_payload(
+                                p.proof_with_data(),
+                                self.batch_reader.clone(),
+                                block,
+                                &self.ordered_authors,
+                                None,
+                            )
+                            .await?;
+                            let mut opt_txns = process_optqs_payload(
+                                p.opt_batches(),
+                                self.batch_reader.clone(),
+                                block,
+                                &self.ordered_authors,
+                                block_signers.as_ref(),
+                            )
+                            .await?;
+                            let inline_txns = p.inline_batches().transactions();
+                            all_txns.append(&mut proof_txns);
+                            all_txns.append(&mut opt_txns);
+                            all_txns.extend(inline_txns);
+                        },
+                        _ => unreachable!(
+                            "Unexpected sub-payload type in OrderedPayloads: {}",
+                            sub_payload,
+                        ),
+                    }
+                }
+                BlockTransactionPayload::new_quorum_store_inline_hybrid(
+                    all_txns,
+                    all_proofs,
+                    None,
+                    None,
+                    all_inline_batch_infos,
+                    self.enable_payload_v2,
+                )
+            },
             _ => unreachable!(
                 "Wrong payload {} epoch {}, round {}, id {}",
                 payload,
@@ -623,6 +788,17 @@ fn get_inline_transactions(block: &Block) -> Vec<SignedTransaction> {
         },
         Payload::OptQuorumStore(OptQuorumStorePayload::V1(p)) => p.inline_batches().transactions(),
         Payload::OptQuorumStore(OptQuorumStorePayload::V2(p)) => p.inline_batches().transactions(),
+        Payload::OrderedPayloads(payloads) => payloads
+            .iter()
+            .flat_map(|sub| match sub {
+                Payload::QuorumStoreInlineHybrid(inline_batches, ..)
+                | Payload::QuorumStoreInlineHybridV2(inline_batches, ..) => inline_batches
+                    .iter()
+                    .flat_map(|(_, txns)| txns.clone())
+                    .collect::<Vec<_>>(),
+                _ => vec![],
+            })
+            .collect(),
         _ => {
             vec![] // Other payload types do not have inline transactions
         },

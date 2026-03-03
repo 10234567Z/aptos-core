@@ -121,6 +121,7 @@ impl Block {
                 Payload::OptQuorumStore(opt_quorum_store_payload) => {
                     opt_quorum_store_payload.num_txns()
                 },
+                Payload::OrderedPayloads(_) => payload.len(),
             },
         }
     }
@@ -156,6 +157,7 @@ impl Block {
                         p.proof_with_data().num_bytes(),
                     ),
                 },
+                Payload::OrderedPayloads(_) => (0, 0, 0),
             },
         }
     }

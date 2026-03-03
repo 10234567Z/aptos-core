@@ -550,7 +550,9 @@ impl RoundManager {
                 .can_propose_in_round(new_round_event.round)
         {
             // When proxy consensus is active, primary blocks should be formed from
-            // proxy blocks. Defer proposal generation until proxy blocks arrive.
+            // proxy blocks. If proxy blocks are available, include them. If not,
+            // propose an empty block to avoid timeout (e.g. at startup before
+            // the txn emitter starts and proxy consensus orders empty blocks).
             if self.proxy_verifier.is_some() {
                 if !self.pending_proxy_blocks.is_empty() {
                     // Proxy blocks already available (arrived before round event).
@@ -561,23 +563,19 @@ impl RoundManager {
                         self.pending_proxy_blocks.len(),
                         new_round_event.round,
                     );
-                    self.spawn_proposal_generation(new_round_event);
                 } else {
-                    // Wait for proxy blocks to arrive before proposing.
-                    let commit_round = self.block_store.commit_root().round();
-                    let ordered_round = self.block_store.ordered_root().round();
+                    // No proxy blocks yet — propose empty block to avoid timeout.
+                    // This happens at startup before load begins, or during proxy
+                    // consensus stalls. Empty proposals keep primary rounds advancing.
                     info!(
                         self.new_log(LogEvent::NewRound),
-                        "Proxy consensus active, deferring proposal for round {} until proxy blocks arrive. \
-                         last_consumed_proxy_round={}, commit_round={}, ordered_round={}, pipeline_gap={}",
+                        "No proxy blocks available, proposing empty block for round {} to avoid timeout. \
+                         last_consumed_proxy_round={}",
                         new_round_event.round,
                         self.last_consumed_proxy_round,
-                        commit_round,
-                        ordered_round,
-                        ordered_round.saturating_sub(commit_round),
                     );
-                    self.pending_proposal_event = Some(new_round_event);
                 }
+                self.spawn_proposal_generation(new_round_event);
             } else {
                 // No proxy consensus — or this IS the proxy RM.
                 self.spawn_proposal_generation(new_round_event);
@@ -595,79 +593,116 @@ impl RoundManager {
         let sync_info = self.block_store.sync_info();
         let proxy_hooks = self.proxy_hooks.clone();
 
-        // Leader-driven cut: determine which proxy blocks to include
-        let proxy_payload = if !self.pending_proxy_blocks.is_empty() && proxy_hooks.is_none() {
-            // Determine start: parent's last_proxy_round (if ProxyAggregatedV0) or 0
-            let parent_id = sync_info.highest_quorum_cert().certified_block().id();
-            let start_after = self
-                .block_store
-                .get_block(parent_id)
-                .and_then(|b| b.block().block_data().last_proxy_round())
-                .unwrap_or(0);
+        // Leader-driven cut: determine which proxy blocks to include.
+        // When proxy consensus is active (proxy_verifier.is_some()) on the primary RM
+        // (proxy_hooks.is_none()), ALWAYS produce a proxy payload — even if empty.
+        // Using None would fall to the standard QS pull path, causing duplication:
+        // non-proxy validators' proof queues have the same batches from QS broadcast
+        // but never marked ordered, so QS pull re-includes them alongside proxy blocks.
+        let is_primary_with_proxy = self.proxy_verifier.is_some() && proxy_hooks.is_none();
+        let proxy_payload = if is_primary_with_proxy {
+            if !self.pending_proxy_blocks.is_empty() {
+                // Determine start: parent's last_proxy_round (if ProxyAggregatedV0) or 0
+                let parent_id = sync_info.highest_quorum_cert().certified_block().id();
+                let start_after = self
+                    .block_store
+                    .get_block(parent_id)
+                    .and_then(|b| b.block().block_data().last_proxy_round())
+                    .unwrap_or(0);
 
-            // Collect blocks from pending_proxy_blocks with round > start_after
-            // Always include at least one block.
-            use std::ops::Bound;
-            let blocks_to_include: Vec<Arc<Block>> = self
-                .pending_proxy_blocks
-                .range((Bound::Excluded(start_after), Bound::Unbounded))
-                .map(|(_, b)| b.clone())
-                .collect();
+                // Collect blocks from pending_proxy_blocks with round > start_after
+                use std::ops::Bound;
+                let blocks_to_include: Vec<Arc<Block>> = self
+                    .pending_proxy_blocks
+                    .range((Bound::Excluded(start_after), Bound::Unbounded))
+                    .map(|(_, b)| b.clone())
+                    .collect();
 
-            if blocks_to_include.is_empty() {
-                None
-            } else {
-                let last_block = blocks_to_include.last().expect("blocks_to_include is non-empty");
-                let last_proxy_round = last_block.round();
-                let last_proxy_block_id = last_block.id();
+                if blocks_to_include.is_empty() {
+                    // All pending blocks are before start_after (already included in parent).
+                    // Propose empty to avoid QS pull duplication.
+                    info!(
+                        "spawn_proposal_generation: pending proxy blocks exist but all before \
+                         start_after={}, proposing empty proxy block. last_consumed_proxy_round={}",
+                        start_after, self.last_consumed_proxy_round,
+                    );
+                    Some((Vec::new(), Payload::empty(true, true), self.last_consumed_proxy_round, HashValue::zero()))
+                } else {
+                    let last_block = blocks_to_include.last().expect("blocks_to_include is non-empty");
+                    let last_proxy_round = last_block.round();
+                    let last_proxy_block_id = last_block.id();
 
-                // Aggregate validator txns and payloads
-                let mut all_vtxns = Vec::new();
-                let mut merged_payload: Option<Payload> = None;
-                for block in &blocks_to_include {
-                    if let Some(vtxns) = block.validator_txns() {
-                        all_vtxns.extend(vtxns.iter().cloned());
-                    }
-                    if let Some(p) = block.payload().cloned() {
-                        if !p.is_empty() {
-                            merged_payload = Some(match merged_payload {
-                                Some(existing) => existing.extend(p),
-                                None => p,
-                            });
+                    // Aggregate validator txns and payloads.
+                    // Cap vtxn count at the configured per-block limit to prevent
+                    // voters from rejecting the proposal. When aggregating multiple
+                    // proxy blocks, DKG vtxns can accumulate past the limit.
+                    let vtxn_limit = self.vtxn_config.per_block_limit_txn_count() as usize;
+                    let mut all_vtxns = Vec::new();
+                    let mut sub_payloads = Vec::new();
+                    for block in &blocks_to_include {
+                        if let Some(vtxns) = block.validator_txns() {
+                            let remaining = vtxn_limit.saturating_sub(all_vtxns.len());
+                            if remaining > 0 {
+                                all_vtxns.extend(vtxns.iter().take(remaining).cloned());
+                            }
+                        }
+                        if let Some(p) = block.payload().cloned() {
+                            if !p.is_empty() {
+                                sub_payloads.push(p);
+                            }
                         }
                     }
+                    let payload = match sub_payloads.len() {
+                        0 => Payload::empty(true, true),
+                        1 => sub_payloads.into_iter().next().unwrap(),
+                        _ => Payload::OrderedPayloads(sub_payloads),
+                    };
+
+                    // Update last_consumed_proxy_round
+                    self.last_consumed_proxy_round = last_proxy_round;
+
+                    // Remove consumed blocks from the buffer
+                    let to_remove: Vec<Round> = self
+                        .pending_proxy_blocks
+                        .range(..=last_proxy_round)
+                        .map(|(r, _)| *r)
+                        .collect();
+                    for r in to_remove {
+                        self.pending_proxy_blocks.remove(&r);
+                    }
+
+                    let payload_len = payload.len();
+                    let payload_size = payload.size();
+                    info!(
+                        "spawn_proposal_generation: aggregated {} proxy blocks, {} txns, {} bytes, \
+                         {} vtxns, last_proxy_round={}, last_consumed_proxy_round={}",
+                        blocks_to_include.len(), payload_len, payload_size, all_vtxns.len(),
+                        last_proxy_round, self.last_consumed_proxy_round,
+                    );
+                    aptos_proxy_primary::proxy_metrics::PROXY_AGGREGATED_PAYLOAD_SIZE
+                        .set(payload_len as i64);
+
+                    // Send updated pipeline state to proxy
+                    self.send_pipeline_state_to_proxy();
+
+                    Some((all_vtxns, payload, last_proxy_round, last_proxy_block_id))
                 }
-                let payload = merged_payload.unwrap_or_else(|| Payload::empty(true, true));
-
-                // Update last_consumed_proxy_round
-                self.last_consumed_proxy_round = last_proxy_round;
-
-                // Remove consumed blocks from the buffer
-                let to_remove: Vec<Round> = self
-                    .pending_proxy_blocks
-                    .range(..=last_proxy_round)
-                    .map(|(r, _)| *r)
-                    .collect();
-                for r in to_remove {
-                    self.pending_proxy_blocks.remove(&r);
-                }
-
-                let payload_len = payload.len();
-                let payload_size = payload.size();
+            } else {
+                // No proxy blocks available — propose empty ProxyAggregatedV0 block.
+                // This avoids the standard QS pull path which would re-include batches
+                // already ordered by proxy consensus, causing duplicate execution.
                 info!(
-                    "spawn_proposal_generation: aggregated {} proxy blocks, {} txns, {} bytes, \
-                     {} vtxns, last_proxy_round={}, last_consumed_proxy_round={}",
-                    blocks_to_include.len(), payload_len, payload_size, all_vtxns.len(),
-                    last_proxy_round, self.last_consumed_proxy_round,
+                    "spawn_proposal_generation: no proxy blocks available, proposing empty proxy block. \
+                     last_consumed_proxy_round={}",
+                    self.last_consumed_proxy_round,
                 );
-                aptos_proxy_primary::proxy_metrics::PROXY_AGGREGATED_PAYLOAD_SIZE
-                    .set(payload_len as i64);
-
-                // Send updated pipeline state to proxy
-                self.send_pipeline_state_to_proxy();
-
-                Some((all_vtxns, payload, last_proxy_round, last_proxy_block_id))
+                Some((Vec::new(), Payload::empty(true, true), self.last_consumed_proxy_round, HashValue::zero()))
             }
+        } else if !self.pending_proxy_blocks.is_empty() {
+            // This shouldn't happen (pending_proxy_blocks should only be non-empty
+            // when proxy consensus is active), but handle gracefully.
+            warn!("spawn_proposal_generation: pending_proxy_blocks non-empty but proxy not active");
+            None
         } else {
             None
         };
@@ -938,6 +973,14 @@ impl RoundManager {
         } else if let Some((vtxns, payload, last_proxy_round, last_proxy_block_id)) = proxy_payload {
             // Primary RoundManager with proxy payload: use aggregated proxy transactions
             // Primary adds zero new transactions — block content comes entirely from proxy blocks
+            info!(
+                consensus_type = consensus_type,
+                round = new_round_event.round,
+                vtxn_count = vtxns.len(),
+                payload_len = payload.len(),
+                last_proxy_round = last_proxy_round,
+                "generate_proposal: using proxy payload path (no QS pull)"
+            );
             proposal_generator
                 .generate_proposal_with_proxy_payload(
                     new_round_event.round,
@@ -949,7 +992,14 @@ impl RoundManager {
                 )
                 .await?
         } else {
-            // Standard proposal (non-proxy leader or fallback)
+            // Standard proposal (non-proxy leader or fallback).
+            // WARNING: If this fires when proxy consensus is active, it means
+            // the QS pull duplication bug is present.
+            warn!(
+                consensus_type = consensus_type,
+                round = new_round_event.round,
+                "generate_proposal: FALLBACK to standard QS pull path"
+            );
             proposal_generator
                 .generate_proposal(new_round_event.round, proposer_election)
                 .await?
