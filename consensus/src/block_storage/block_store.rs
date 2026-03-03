@@ -359,6 +359,20 @@ impl BlockStore {
         // (pipeline_builder is None for proxy). For proxy, ordering IS the final step —
         // treat ordered blocks as committed for tree management.
         if self.consensus_type == "proxy" {
+            // Mark ordered batches as committed in the proof queue to prevent other
+            // proxy proposers from re-pulling the same batch proofs. Uses notify_ordered
+            // (NOT notify_commit) because notify_commit would also notify BatchGenerator
+            // (prematurely releasing txns for re-batching) and update the certified
+            // timestamp on BatchStore (potentially GC-ing data needed by primary execution).
+            // The full notify_commit arrives later when primary consensus commits.
+            let payloads: Vec<_> = blocks_to_commit
+                .iter()
+                .filter_map(|b| b.payload().cloned())
+                .collect();
+            if !payloads.is_empty() {
+                self.payload_manager.notify_ordered(payloads);
+            }
+
             let ids_to_remove = self.inner.read().find_blocks_to_prune(ordered_root_id);
             if let Err(e) = self
                 .storage
