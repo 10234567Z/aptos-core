@@ -711,6 +711,6 @@ where
 
         fn charge_slh_dsa_sha2_128s(&mut self) -> VMResult<()>;
 
-        fn charge_randomness_txn(&mut self) -> VMResult<()>;
+        fn charge_randomness_txn(&mut self, gas_unit_price: FeePerGasUnit) -> VMResult<()>;
     }
 }

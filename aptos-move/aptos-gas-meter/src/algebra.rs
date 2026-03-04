@@ -42,6 +42,11 @@ where
     // The storage fee consumed by the storage operations.
     storage_fee_used: Fee,
 
+    // The gas consumed by feature fees (e.g., randomness).
+    feature_fee_in_internal_units: InternalGas,
+    // The feature fee consumed.
+    feature_fee_used: Fee,
+
     num_dependencies: NumModules,
     total_dependency_size: NumBytes,
 
@@ -99,6 +104,8 @@ where
             max_storage_fee,
             storage_fee_in_internal_units: 0.into(),
             storage_fee_used: 0.into(),
+            feature_fee_in_internal_units: 0.into(),
+            feature_fee_used: 0.into(),
             num_dependencies: 0.into(),
             total_dependency_size: 0.into(),
             block_synchronization_kill_switch,
@@ -150,17 +157,18 @@ where
             })?;
 
         let total_calculated =
-            self.execution_gas_used + self.io_gas_used + self.storage_fee_in_internal_units;
+            self.execution_gas_used + self.io_gas_used + self.storage_fee_in_internal_units + self.feature_fee_in_internal_units;
         if total != total_calculated {
             return Err(
                 PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR).with_message(
                     format!(
-                        "The per-category costs do not add up. {} (total) != {} = {} (exec) + {} (io) + {} (storage)",
+                        "The per-category costs do not add up. {} (total) != {} = {} (exec) + {} (io) + {} (storage) + {} (feature)",
                         total,
                         total_calculated,
                         self.execution_gas_used,
                         self.io_gas_used,
                         self.storage_fee_in_internal_units,
+                        self.feature_fee_in_internal_units,
                     ),
                 ),
             );
@@ -295,6 +303,61 @@ where
         }
 
         Ok(())
+    }
+
+    fn charge_feature_fee(
+        &mut self,
+        abstract_amount: impl GasExpression<VMGasParameters, Unit = Octa>,
+        gas_unit_price: FeePerGasUnit,
+    ) -> PartialVMResult<()> {
+        let amount = abstract_amount.evaluate(self.feature_version, &self.vm_gas_params);
+
+        let txn_params = &self.vm_gas_params.txn;
+
+        // Same Octa→internal-gas-unit conversion as charge_storage_fee.
+        fn div_ceil(n: u128, d: u128) -> u128 {
+            if n.is_multiple_of(d) {
+                n / d
+            } else {
+                n / d + 1
+            }
+        }
+        let gas_consumed_internal = div_ceil(
+            (u64::from(amount) as u128) * (u64::from(txn_params.gas_unit_scaling_factor) as u128),
+            u64::from(gas_unit_price) as u128,
+        );
+        let gas_consumed_internal = InternalGas::new(
+            if gas_consumed_internal > u64::MAX as u128 {
+                error!(
+                    "Something's wrong in the gas schedule: gas_consumed_internal ({}) > u64::MAX",
+                    gas_consumed_internal
+                );
+                u64::MAX
+            } else {
+                gas_consumed_internal as u64
+            },
+        );
+
+        match self.balance.checked_sub(gas_consumed_internal) {
+            Some(new_balance) => {
+                self.balance = new_balance;
+                self.feature_fee_in_internal_units += gas_consumed_internal;
+                self.feature_fee_used += amount;
+            },
+            None => {
+                let old_balance = self.balance;
+                self.balance = 0.into();
+                self.feature_fee_in_internal_units += old_balance;
+                self.feature_fee_used += amount;
+                return Err(PartialVMError::new(StatusCode::OUT_OF_GAS));
+            },
+        };
+
+        Ok(())
+    }
+
+    fn feature_fee_used(&self) -> Fee {
+        self.feature_fee_used
     }
 
     fn count_dependency(&mut self, size: NumBytes) -> PartialVMResult<()> {

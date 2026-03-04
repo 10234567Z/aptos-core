@@ -634,13 +634,13 @@ where
             .map_err(|e| e.finish(Location::Undefined))
     }
 
-    fn charge_randomness_txn(&mut self) -> VMResult<()> {
+    fn charge_randomness_txn(&mut self, gas_unit_price: FeePerGasUnit) -> VMResult<()> {
         if self.feature_version() < RELEASE_V1_44 {
             return Ok(());
         }
 
         self.algebra
-            .charge_execution(RANDOMNESS_TXN_BASE_COST)
+            .charge_feature_fee(RANDOMNESS_TXN_FEE, gas_unit_price)
             .map_err(|e| e.finish(Location::Undefined))
     }
 }

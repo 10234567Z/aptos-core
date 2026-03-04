@@ -730,8 +730,8 @@ where
         res
     }
 
-    fn charge_randomness_txn(&mut self) -> VMResult<()> {
-        let (cost, res) = self.delegate_charge(|base| base.charge_randomness_txn());
+    fn charge_randomness_txn(&mut self, gas_unit_price: FeePerGasUnit) -> VMResult<()> {
+        let (cost, res) = self.delegate_charge(|base| base.charge_randomness_txn(gas_unit_price));
 
         self.randomness_txn_cost = Some(
             self.randomness_txn_cost

@@ -283,9 +283,9 @@ crate::gas_schedule::macros::define_gas_parameters!(
             13_800_000,
         ],
         [
-            randomness_txn_base_cost: InternalGas,
-            { RELEASE_V1_44.. => "randomness_txn.base" },
-            10_000_000,
+            randomness_txn_fee: Fee,
+            { RELEASE_V1_44.. => "randomness_txn.fee" },
+            100_000,
         ],
     ]
 );
