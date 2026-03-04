@@ -971,6 +971,9 @@ impl<P: OnChainConfigProvider> EpochManager<P> {
         let signer = Arc::new(ValidatorSigner::new(self.author, consensus_sk));
         let pipeline_builder = self.execution_client.pipeline_builder(signer);
         info!(epoch = epoch, "Create BlockStore");
+        // Shared atomic for primary→proxy commit signaling.
+        // Primary's commit callback writes last_proxy_round; proxy reads it to advance commit_root.
+        let primary_committed_proxy_round = Arc::new(std::sync::atomic::AtomicU64::new(0));
         // Read the last vote, before "moving" `recovery_data`
         let last_vote = recovery_data.last_vote();
         let block_store = Arc::new(BlockStore::new(
@@ -986,6 +989,7 @@ impl<P: OnChainConfigProvider> EpochManager<P> {
             self.pending_blocks.clone(),
             Some(pipeline_builder),
             "primary",
+            Some(primary_committed_proxy_round.clone()),
         ));
 
         let failures_tracker = Arc::new(Mutex::new(ExponentialWindowFailureTracker::new(
@@ -1037,7 +1041,6 @@ impl<P: OnChainConfigProvider> EpochManager<P> {
                 .quorum_store
                 .allow_batches_without_pos_in_proposal,
             opt_qs_payload_param_provider,
-            false, // is_proxy
         );
         let (round_manager_tx, round_manager_rx) = aptos_channel::new(
             QueueStyle::KLAST,
@@ -1134,6 +1137,7 @@ impl<P: OnChainConfigProvider> EpochManager<P> {
                     &onchain_randomness_config,
                     &onchain_jwk_consensus_config,
                     proxy_verifier.clone().expect("proxy_verifier must exist when proxy_enabled"),
+                    primary_committed_proxy_round.clone(),
                 );
 
             // Store the proxy RoundManager's event channels for routing incoming proxy messages
@@ -1263,6 +1267,7 @@ impl<P: OnChainConfigProvider> EpochManager<P> {
         onchain_randomness_config: &OnChainRandomnessConfig,
         onchain_jwk_consensus_config: &OnChainJWKConsensusConfig,
         proxy_verifier: Arc<ValidatorVerifier>,
+        primary_committed_proxy_round: Arc<std::sync::atomic::AtomicU64>,
     ) -> (
         aptos_channel::Sender<(Author, Discriminant<VerifiedEvent>), (Author, VerifiedEvent)>,
         aptos_channel::Sender<Author, VerifiedEvent>,
@@ -1387,13 +1392,14 @@ impl<P: OnChainConfigProvider> EpochManager<P> {
             proxy_execution_client,
             self.config.max_pruned_blocks_in_mem,
             Arc::clone(&self.time_service),
-            None, // Proxy doesn't execute blocks, so commit_root never advances — disable back pressure
+            None, // Proxy doesn't execute blocks — disable back pressure
             payload_manager,
             onchain_consensus_config.order_vote_enabled(),
             onchain_consensus_config.window_size(),
             Arc::new(Mutex::new(PendingBlocks::new())),
             None, // pipeline_builder: None - proxy doesn't execute blocks
             "proxy",
+            Some(primary_committed_proxy_round),
         ));
 
         // 8. Create ProposalGenerator for proxy
@@ -1456,7 +1462,6 @@ impl<P: OnChainConfigProvider> EpochManager<P> {
                 .quorum_store
                 .allow_batches_without_pos_in_proposal,
             opt_qs_payload_param_provider,
-            true, // is_proxy
         );
 
         // 9. Create channels for the proxy RoundManager

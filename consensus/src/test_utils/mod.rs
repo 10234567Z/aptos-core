@@ -105,6 +105,7 @@ fn build_empty_tree_inner(
         Arc::new(Mutex::new(PendingBlocks::new())),
         pipeline_builder,
         "primary",
+        None,
     )
 }
 

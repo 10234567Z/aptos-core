@@ -29,10 +29,6 @@ use std::{collections::HashMap, future::Future, ops::Deref, pin::Pin, sync::Arc}
 
 pub trait TQuorumStoreCommitNotifier: Send + Sync {
     fn notify(&self, block_timestamp: u64, batches: Vec<BatchInfoExt>);
-
-    /// Notify that batches have been ordered (proxy consensus) but not yet committed by primary.
-    /// Only marks batches in the proof queue to prevent re-pulling by other proposers.
-    fn notify_ordered(&self, batches: Vec<BatchInfoExt>);
 }
 
 pub struct QuorumStoreCommitNotifier {
@@ -60,16 +56,6 @@ impl TQuorumStoreCommitNotifier for QuorumStoreCommitNotifier {
         }
     }
 
-    fn notify_ordered(&self, batches: Vec<BatchInfoExt>) {
-        let mut tx = self.coordinator_tx.clone();
-
-        if let Err(e) = tx.try_send(CoordinatorCommand::OrderNotification(batches)) {
-            warn!(
-                "OrderNotification failed. Is the epoch shutting down? error: {}",
-                e
-            );
-        }
-    }
 }
 
 /// A payload manager that resolves the transactions in a block's payload from the quorum store.
@@ -260,15 +246,6 @@ impl TPayloadManager for QuorumStorePayloadManager {
             .collect();
 
         self.commit_notifier.notify(block_timestamp, batches);
-    }
-
-    fn notify_ordered(&self, payloads: Vec<Payload>) {
-        let batches: Vec<_> = payloads
-            .into_iter()
-            .flat_map(Self::extract_batch_infos)
-            .collect();
-
-        self.commit_notifier.notify_ordered(batches);
     }
 
     fn prefetch_payload_data(&self, payload: &Payload, author: Author, timestamp: u64) {

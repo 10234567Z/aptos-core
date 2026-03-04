@@ -419,6 +419,7 @@ impl NodeSetup {
             Arc::new(Mutex::new(PendingBlocks::new())),
             None,
             "primary",
+            None,
         ));
         let block_store_clone = Arc::clone(&block_store);
         let callback = Box::new(
@@ -447,7 +448,6 @@ impl NodeSetup {
             onchain_consensus_config.effective_validator_txn_config(),
             true,
             Arc::new(MockOptQSPayloadProvider {}),
-            false, // is_proxy
         );
 
         let round_state = Self::create_round_state(time_service);
@@ -740,10 +740,6 @@ struct MockQuorumStoreCommitNotifier;
 
 impl TQuorumStoreCommitNotifier for MockQuorumStoreCommitNotifier {
     fn notify(&self, _block_timestamp: u64, _batches: Vec<BatchInfoExt>) {
-        unimplemented!()
-    }
-
-    fn notify_ordered(&self, _batches: Vec<BatchInfoExt>) {
         unimplemented!()
     }
 }

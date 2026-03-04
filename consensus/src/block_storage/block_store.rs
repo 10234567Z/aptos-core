@@ -45,7 +45,13 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 #[cfg(any(test, feature = "fuzzing"))]
 use std::sync::atomic::Ordering;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        Arc,
+    },
+    time::Duration,
+};
 
 #[cfg(test)]
 #[path = "block_store_test.rs"]
@@ -110,6 +116,9 @@ pub struct BlockStore {
     pipeline_builder: Option<PipelineBuilder>,
     pre_commit_status: Option<Arc<Mutex<PreCommitStatus>>>,
     consensus_type: &'static str,
+    /// Shared atomic tracking the highest proxy round committed by primary consensus.
+    /// Written by primary's commit_callback, read by proxy's send_for_execution to advance commit_root.
+    primary_committed_proxy_round: Option<Arc<AtomicU64>>,
 }
 
 impl BlockStore {
@@ -126,6 +135,7 @@ impl BlockStore {
         pending_blocks: Arc<Mutex<PendingBlocks>>,
         pipeline_builder: Option<PipelineBuilder>,
         consensus_type: &'static str,
+        primary_committed_proxy_round: Option<Arc<AtomicU64>>,
     ) -> Self {
         let highest_2chain_tc = initial_data.highest_2chain_timeout_certificate();
         let (root, root_metadata, blocks, quorum_certs) = initial_data.take();
@@ -147,6 +157,7 @@ impl BlockStore {
             pipeline_builder,
             None,
             consensus_type,
+            primary_committed_proxy_round,
         ));
         block_on(block_store.try_send_for_execution());
         block_store
@@ -190,6 +201,7 @@ impl BlockStore {
         pipeline_builder: Option<PipelineBuilder>,
         tree_to_replace: Option<Arc<RwLock<BlockTree>>>,
         consensus_type: &'static str,
+        primary_committed_proxy_round: Option<Arc<AtomicU64>>,
     ) -> Self {
         let (commit_root_block, window_root_block, root_qc, root_ordered_cert, root_commit_cert) = (
             root.commit_root_block,
@@ -290,6 +302,7 @@ impl BlockStore {
             window_size,
             pre_commit_status,
             consensus_type,
+            primary_committed_proxy_round,
         };
 
         for block in blocks {
@@ -355,35 +368,35 @@ impl BlockStore {
             .insert_ordered_cert(finality_proof_clone.clone());
         update_counters_for_ordered_blocks(&blocks_to_commit, self.consensus_type);
 
-        // Proxy mode: prune the block tree since commit_callback will never fire
-        // (pipeline_builder is None for proxy). For proxy, ordering IS the final step —
-        // treat ordered blocks as committed for tree management.
+        // Proxy mode: advance commit_root lazily based on what primary has committed.
+        // The primary writes last_proxy_round to the shared atomic on commit; the proxy
+        // reads it here to advance commit_root, keeping blocks between commit_root and
+        // ordered_root in the tree for the proposal generator's exclusion set.
         if self.consensus_type == "proxy" {
-            // Mark ordered batches as committed in the proof queue to prevent other
-            // proxy proposers from re-pulling the same batch proofs. Uses notify_ordered
-            // (NOT notify_commit) because notify_commit would also notify BatchGenerator
-            // (prematurely releasing txns for re-batching) and update the certified
-            // timestamp on BatchStore (potentially GC-ing data needed by primary execution).
-            // The full notify_commit arrives later when primary consensus commits.
-            let payloads: Vec<_> = blocks_to_commit
-                .iter()
-                .filter_map(|b| b.payload().cloned())
-                .collect();
-            if !payloads.is_empty() {
-                self.payload_manager.notify_ordered(payloads);
+            if let Some(atomic) = &self.primary_committed_proxy_round {
+                let committed_round = atomic.load(AtomicOrdering::Acquire);
+                let advance_info = {
+                    let tree = self.inner.read();
+                    if committed_round > tree.commit_root().round() {
+                        tree.find_block_id_by_round(committed_round)
+                            .map(|id| (id, tree.find_blocks_to_prune(id)))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((new_commit_id, ids_to_remove)) = advance_info {
+                    if let Err(e) = self
+                        .storage
+                        .prune_tree(ids_to_remove.clone().into_iter().collect())
+                    {
+                        warn!(error = ?e, "fail to delete block (proxy prune)");
+                    }
+                    let mut wlock = self.inner.write();
+                    wlock.process_pruned_blocks(ids_to_remove);
+                    wlock.update_commit_root(new_commit_id);
+                    wlock.update_window_root(new_commit_id);
+                }
             }
-
-            let ids_to_remove = self.inner.read().find_blocks_to_prune(ordered_root_id);
-            if let Err(e) = self
-                .storage
-                .prune_tree(ids_to_remove.clone().into_iter().collect())
-            {
-                warn!(error = ?e, "fail to delete block (proxy prune)");
-            }
-            let mut wlock = self.inner.write();
-            wlock.process_pruned_blocks(ids_to_remove);
-            wlock.update_commit_root(ordered_root_id);
-            wlock.update_window_root(ordered_root_id);
         }
 
         self.execution_client
@@ -434,6 +447,7 @@ impl BlockStore {
             self.pipeline_builder.clone(),
             Some(self.inner.clone()),
             self.consensus_type,
+            self.primary_committed_proxy_round.clone(),
         )
         .await;
 
@@ -518,9 +532,20 @@ impl BlockStore {
             let id = pipelined_block.id();
             let round = pipelined_block.round();
             let window_size = self.window_size;
+            let last_proxy_round = pipelined_block
+                .block()
+                .block_data()
+                .last_proxy_round();
+            let committed_proxy_round_atomic = self.primary_committed_proxy_round.clone();
             let callback = Box::new(
                 move |finality_proof: WrappedLedgerInfo,
                       commit_decision: LedgerInfoWithSignatures| {
+                    // Update shared atomic when committing a ProxyAggregatedV0 block
+                    if let (Some(atomic), Some(proxy_round)) =
+                        (&committed_proxy_round_atomic, last_proxy_round)
+                    {
+                        atomic.fetch_max(proxy_round, AtomicOrdering::Release);
+                    }
                     if let Some(tree) = block_tree.upgrade() {
                         tree.write().commit_callback(
                             storage,
@@ -737,7 +762,7 @@ impl BlockReader for BlockStore {
 
     /// Return if the consensus is backpressured.
     /// Returns false when back pressure is disabled (vote_back_pressure_limit is None),
-    /// e.g. for proxy BlockStore where commit_root never advances.
+    /// e.g. for proxy BlockStore.
     fn vote_back_pressure(&self) -> bool {
         #[cfg(any(test, feature = "fuzzing"))]
         {
