@@ -419,6 +419,7 @@ mod tests {
         let dkg_config = ChunkyDKG::generate_config(&session_metadata);
 
         let reliable_broadcast = Arc::new(ReliableBroadcast::new(
+            "test",
             my_addr,
             vec![my_addr],
             Arc::new(DummyNetworkSender),
