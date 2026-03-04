@@ -133,12 +133,12 @@ fn proxy_primary_remote_test() -> ForgeConfig {
         }))
         .with_emit_job(
             EmitJobRequest::default()
-                .mode(EmitJobMode::ConstTps { tps: 2000 })
+                .mode(EmitJobMode::ConstTps { tps: 5000 })
                 .gas_price(5 * aptos_global_constants::GAS_UNIT_PRICE)
                 .latency_polling_interval(Duration::from_millis(100)),
         )
         .with_success_criteria(
-            SuccessCriteria::new(1500)
+            SuccessCriteria::new(3000)
                 .add_no_restarts()
                 .add_wait_for_catchup_s(120)
                 .add_chain_progress(StateProgressThreshold {
