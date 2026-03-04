@@ -1358,13 +1358,17 @@ pub fn update_counters_for_compute_result(compute_result: &StateComputeResult) {
     let txn_status = compute_result.compute_status_for_input_txns();
     LAST_COMMITTED_VERSION.set(compute_result.last_version_or_0() as i64);
     NUM_TXNS_PER_BLOCK.observe(txn_status.len() as f64);
+    let mut dup_count = 0u64;
+    let mut seqnum_too_new_count = 0u64;
     for status in txn_status.iter() {
         let commit_status = match status {
             TransactionStatus::Keep(_) => TXN_COMMIT_SUCCESS_LABEL,
             TransactionStatus::Discard(reason) => {
                 if *reason == DiscardedVMStatus::SEQUENCE_NUMBER_TOO_NEW {
+                    seqnum_too_new_count += 1;
                     TXN_COMMIT_SEQNUM_TOO_NEW_LABEL
                 } else if *reason == DiscardedVMStatus::SEQUENCE_NUMBER_TOO_OLD {
+                    dup_count += 1;
                     TXN_COMMIT_FAILED_DUPLICATE_LABEL
                 } else if *reason == DiscardedVMStatus::TRANSACTION_EXPIRED {
                     TXN_COMMIT_FAILED_EXPIRED_LABEL
@@ -1381,6 +1385,15 @@ pub fn update_counters_for_compute_result(compute_result: &StateComputeResult) {
         COMMITTED_TXNS_COUNT
             .with_label_values(&[commit_status])
             .inc();
+    }
+    // [proxy-debug] Log per-block duplicate/seqnum stats when non-zero.
+    if dup_count > 0 || seqnum_too_new_count > 0 {
+        warn!(
+            "[proxy-debug] Block execution: total_txns={}, failed_duplicate={}, seqnum_too_new={}",
+            txn_status.len(),
+            dup_count,
+            seqnum_too_new_count,
+        );
     }
 }
 

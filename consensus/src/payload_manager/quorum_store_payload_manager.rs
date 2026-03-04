@@ -627,6 +627,7 @@ impl TPayloadManager for QuorumStorePayloadManager {
                 let mut all_txns = Vec::new();
                 let mut all_proofs = Vec::new();
                 let mut all_inline_batch_infos = Vec::new();
+                let mut sub_idx = 0usize;
                 for sub_payload in payloads {
                     match sub_payload {
                         Payload::QuorumStoreInlineHybrid(
@@ -698,6 +699,16 @@ impl TPayloadManager for QuorumStorePayloadManager {
                             )
                             .await?;
                             let inline_txns = p.inline_batches().transactions();
+                            // [proxy-debug] Log per-sub-payload txn composition
+                            info!(
+                                "[proxy-debug] OrderedPayloads sub[{}] OptQS_V1: proof_batches={} proof_txns={}, opt_batches={} opt_txns={}, inline_txns={}",
+                                sub_idx,
+                                p.proof_with_data().batch_summary.len(),
+                                proof_txns.len(),
+                                p.opt_batches().batch_summary.len(),
+                                opt_txns.len(),
+                                inline_txns.len(),
+                            );
                             all_txns.append(&mut proof_txns);
                             all_txns.append(&mut opt_txns);
                             all_txns.extend(inline_txns);
@@ -720,6 +731,16 @@ impl TPayloadManager for QuorumStorePayloadManager {
                             )
                             .await?;
                             let inline_txns = p.inline_batches().transactions();
+                            // [proxy-debug] Log per-sub-payload txn composition
+                            info!(
+                                "[proxy-debug] OrderedPayloads sub[{}] OptQS_V2: proof_batches={} proof_txns={}, opt_batches={} opt_txns={}, inline_txns={}",
+                                sub_idx,
+                                p.proof_with_data().batch_summary.len(),
+                                proof_txns.len(),
+                                p.opt_batches().batch_summary.len(),
+                                opt_txns.len(),
+                                inline_txns.len(),
+                            );
                             all_txns.append(&mut proof_txns);
                             all_txns.append(&mut opt_txns);
                             all_txns.extend(inline_txns);
@@ -729,7 +750,14 @@ impl TPayloadManager for QuorumStorePayloadManager {
                             sub_payload,
                         ),
                     }
+                    sub_idx += 1;
                 }
+                info!(
+                    "[proxy-debug] OrderedPayloads round={}: sub_payloads={}, total_txns={}",
+                    block.block_data().round(),
+                    sub_idx,
+                    all_txns.len(),
+                );
 
                 BlockTransactionPayload::new_quorum_store_inline_hybrid(
                     all_txns,
